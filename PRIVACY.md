@@ -24,4 +24,4 @@ The Extension interacts directly with Google's Gemini interface to provide its f
 If we introduce new features that require a change in our data practices, we will update this Privacy Policy accordingly and ensure full transparency. 
 
 ## 6. Contact
-If you have any questions or concerns regarding this Privacy Policy or your data, please open an issue in our GitHub repository.
+If you have any questions or concerns regarding this Privacy Policy or your data, please contact us via email at **dieptien290620@gmail.com** or open an issue in our [GitHub repository](https://github.com/diepvantien/Image-Downloader-for-Gemini---No-Watermark).
