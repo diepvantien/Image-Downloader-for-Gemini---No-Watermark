@@ -59,4 +59,13 @@ document.addEventListener('DOMContentLoaded', () => {
       reader.readAsDataURL(file);
     });
   }
+
+  // Handle Feedback Mailto link
+  const feedbackLink = document.getElementById('feedbackLink');
+  if (feedbackLink) {
+    feedbackLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      chrome.tabs.create({ url: 'mailto:dieptien290620@gmail.com' });
+    });
+  }
 });
