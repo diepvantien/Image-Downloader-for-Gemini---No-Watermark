@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Image Downloader for Gemini - No Watermark",
   "short_name": "Unwatermark",
-  "version": "1.0.6",
+  "version": "1.0.0",
   "description": "Download Gemini AI images without watermark. Export PNG/JPEG/WebP. Crop tools.",
   "permissions": [
     "storage"
