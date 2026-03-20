@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Editor</title>
+<style>
+  :root {
+    --bg:#fdf6e3;
+    --surface:#eee8d5;
+    --surface2:#e2d5b8;
+    --border:rgba(100,80,70,.15);
+    --border-hi:rgba(196,115,53,.3);
+    --text:#4a3e3d;
+    --muted:#7a6e6a;
+    --accent:#c47335;
+    --accent-bg:rgba(196,115,53,.15);
+    --purple:#8c5a5a;
+    --purple-bg:rgba(140,90,90,.15);
+    --success:#5c8a5c;
+    --warn:#d08f32;
+    --red:#cc4d4d;
+    --r:9px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;overflow:hidden;}
+  body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;display:flex;flex-direction:column;}
+  header{display:flex;align-items:center;gap:12px;padding:0 16px;height:50px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;}
+  .logo{display:flex;align-items:center;gap:7px;font-size:13.5px;font-weight:600;}
+  .logo svg{color:var(--accent);}
+  .spacer{flex:1;}
+  .status-badge{display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:20px;font-size:11.5px;font-weight:500;background:var(--accent-bg);color:var(--accent);border:1px solid rgba(196,115,53,.2);transition:all .3s;}
+  .status-badge.loading{background:rgba(208,143,50,.15);color:var(--warn);border-color:rgba(208,143,50,.25);}
+  .status-badge.done{background:rgba(92,138,92,.15);color:var(--success);border-color:rgba(92,138,92,.25);}
+  .status-badge.error{background:rgba(204,77,77,.15);color:var(--red);border-color:rgba(204,77,77,.25);}
+  .dot{width:6px;height:6px;border-radius:50%;background:currentColor;}
+  .dot.pulse{animation:pulse 1.4s infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .app{display:flex;flex:1;overflow:hidden;}
+  aside{width:268px;flex-shrink:0;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;}
+  aside::-webkit-scrollbar{width:3px;}
+  aside::-webkit-scrollbar-thumb{background:rgba(0,0,0,.1);border-radius:2px;}
+  .sec{padding:13px 14px;border-bottom:1px solid var(--border);}
+  .sec-title{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:10px;}
+  .toggle-row{display:flex;align-items:center;justify-content:space-between;}
+  .toggle-label{font-size:12.5px;}
+  .toggle{position:relative;width:36px;height:20px;cursor:pointer;}
+  .toggle input{opacity:0;width:0;height:0;}
+  .toggle-track{position:absolute;inset:0;background:rgba(0,0,0,.1);border-radius:10px;transition:background .2s;border:1px solid var(--border);}
+  .toggle input:checked~.toggle-track{background:var(--accent);border-color:var(--accent);}
+  .toggle-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .2s;box-shadow:0 1px 4px rgba(0,0,0,.2);}
+  .toggle input:checked~.toggle-track~.toggle-thumb{transform:translateX(16px);}
+  .fmt-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;}
+  .fmt-btn{padding:7px 4px;border-radius:7px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-size:12px;font-weight:600;cursor:pointer;text-align:center;transition:all .15s;}
+  .fmt-btn:hover{border-color:rgba(0,0,0,.2);}
+  .fmt-btn.active{background:var(--accent);border-color:var(--accent);color:#fff;}
+  .q-row{margin-top:10px;}
+  .q-labels{display:flex;justify-content:space-between;margin-bottom:5px;color:var(--muted);font-size:12px;}
+  .q-labels span:last-child{color:var(--text);font-weight:600;}
+  input[type="range"]{-webkit-appearance:none;width:100%;height:3px;background:var(--surface2);border-radius:2px;outline:none;border:1px solid var(--border);}
+  input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;background:var(--accent);border-radius:50%;cursor:pointer;box-shadow:0 0 0 3px rgba(196,115,53,.18);}
+  .crop-presets{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:8px;}
+  .crop-preset-btn{padding:7px 4px;border-radius:7px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-size:11.5px;font-weight:600;cursor:pointer;text-align:center;transition:all .15s;line-height:1.35;}
+  .crop-preset-btn .sub{font-size:10px;font-weight:400;opacity:.7;display:block;}
+  .crop-preset-btn:hover{border-color:rgba(0,0,0,.2);}
+  .crop-preset-btn.active,.crop-free-btn.active{background:var(--purple);border-color:var(--purple);color:#fff;}
+  .crop-preset-btn.active .sub, .crop-free-btn.active .sub{color:#f0f0f0;opacity:1;}
+  
+  
+  .crop-info{font-size:11.5px;color:var(--muted);background:var(--surface2);padding:7px 9px;border-radius:7px;line-height:1.6;border:1px solid var(--border);min-height:44px;}
+  .crop-info strong{color:var(--text);}
+  .crop-btns{display:flex;gap:6px;margin-top:8px;}
+  .info-grid{display:flex;flex-direction:column;gap:5px;}
+  .info-row{display:flex;justify-content:space-between;align-items:center;}
+  .info-key{color:var(--muted);font-size:12px;}
+  .info-val{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums;font-size:12px;}
+  .btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:9px 14px;border-radius:var(--r);font-size:12.5px;font-weight:600;cursor:pointer;transition:all .15s;border:1px solid transparent;}
+  .btn-primary{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .btn-primary:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 4px 14px rgba(196,115,53,.3);}
+  .btn-secondary{background:var(--surface2);color:var(--text);border-color:var(--border);}
+  .btn-secondary:hover{border-color:rgba(0,0,0,.2);background:var(--surface);}
+  .btn-sm{padding:5px 10px;font-size:11.5px;border-radius:6px;flex:1;}
+  .btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none;}
+  .btn-col{display:flex;flex-direction:column;gap:7px;}
+  main{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+  .toolbar{display:flex;align-items:center;gap:5px;padding:8px 14px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
+  .tb-btn{display:flex;align-items:center;gap:4px;padding:5px 10px;border-radius:6px;font-size:12px;font-weight:500;color:var(--muted);background:transparent;border:1px solid transparent;cursor:pointer;transition:all .15s;white-space:nowrap;}
+  .tb-btn:hover{background:var(--surface2);color:var(--text);border-color:var(--border);}
+  .tb-btn.active{background:var(--accent-bg);color:var(--accent);border-color:var(--border-hi);}
+  .tb-sep{width:1px;height:18px;background:var(--border);margin:0 2px;flex-shrink:0;}
+  .zoom-group{display:flex;align-items:center;gap:6px;}
+  .zoom-icon-btn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:5px;background:transparent;border:1px solid var(--border);color:var(--muted);cursor:pointer;transition:all .15s;flex-shrink:0;}
+  .zoom-icon-btn:hover{background:var(--surface2);color:var(--text);border-color:rgba(0,0,0,.2);}
+  #zoomSlider{-webkit-appearance:none;width:88px;height:3px;background:var(--surface2);border-radius:2px;outline:none;border:1px solid var(--border);cursor:pointer;}
+  #zoomSlider::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--accent);border-radius:50%;cursor:pointer;box-shadow:0 0 0 3px rgba(196,115,53,.15);}
+  .zoom-val{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums;min-width:38px;text-align:center;cursor:pointer;padding:3px 5px;border-radius:4px;border:1px solid transparent;transition:all .15s;}
+  .zoom-val:hover{background:var(--surface2);border-color:var(--border);color:var(--text);}
+  .canvas-wrapper{flex:1;overflow:auto;display:flex;align-items:center;justify-content:center;padding:28px;background:radial-gradient(circle at 50% 50%,rgba(196,115,53,.08) 0%,transparent 65%),var(--bg);}
+  .canvas-wrapper::-webkit-scrollbar{width:5px;height:5px;}
+  .canvas-wrapper::-webkit-scrollbar-thumb{background:rgba(0,0,0,.15);border-radius:3px;}
+  .canvas-container{position:relative;display:inline-block;line-height:0;}
+  .canvas-container.mode-crop{cursor:crosshair;}
+  .canvas-container.mode-view{cursor:default;}
+  #mainCanvas{display:block;max-width:none;box-shadow:0 8px 40px rgba(0,0,0,.1),0 0 0 1px rgba(0,0,0,.05);border-radius:3px;}
+  #cropCanvas{position:absolute;top:0;left:0;pointer-events:none;border-radius:3px;}
+  #loadingOverlay{position:fixed;inset:0;background:rgba(253,246,227,.93);backdrop-filter:blur(14px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;z-index:1000;}
+  #loadingOverlay.hidden{display:none;}
+  .spinner{width:34px;height:34px;border:3px solid rgba(196,115,53,.2);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .ld-text{color:var(--text);font-size:14px;font-weight:600;}
+  .ld-sub{color:var(--muted);font-size:12px;max-width:340px;text-align:center;}
+</style>
+</head>
+<body>
+<div id="loadingOverlay">
+  <div class="spinner"></div>
+  <div class="ld-text" id="loadingText">Loading image...</div>
+  <div class="ld-sub" id="loadingSubText">Please wait</div>
+</div>
+<header>
+  <div class="logo">
+    Image Editor
+  </div>
+  <div class="spacer"></div>
+  <div class="status-badge loading" id="statusBadge"><span class="dot pulse"></span><span id="statusText">Processing...</span></div>
+</header>
+<div class="app">
+  <aside>
+    <div class="sec">
+      <div class="sec-title">Watermark</div>
+      <label class="toggle-row">
+        <span class="toggle-label">Remove Gemini Watermark</span>
+        <label class="toggle"><input type="checkbox" id="toggleWatermark" checked><span class="toggle-track"></span><span class="toggle-thumb"></span></label>
+      </label>
+    </div>
+    <div class="sec">
+      <div class="sec-title">Export Format</div>
+      <div class="fmt-grid">
+        <button class="fmt-btn active" data-fmt="png">PNG</button>
+        <button class="fmt-btn" data-fmt="jpeg">JPEG</button>
+        <button class="fmt-btn" data-fmt="webp">WebP</button>
+      </div>
+      <div class="q-row" id="qualityRow" style="display:none">
+        <div class="q-labels"><span>Quality</span><span id="qualityDisplay">90%</span></div>
+        <input type="range" id="qualitySlider" min="10" max="100" value="90">
+      </div>
+    </div>
+    <div class="sec">
+      <div class="sec-title">Crop Image</div>
+      <div class="crop-presets">
+        <button class="crop-preset-btn" data-ratio="1:1">1:1<span class="sub">Square</span></button>
+        <button class="crop-preset-btn" data-ratio="16:9">16:9<span class="sub">Wide</span></button>
+        <button class="crop-preset-btn" data-ratio="9:16">9:16<span class="sub">Vertical</span></button>
+        <button class="crop-preset-btn" data-ratio="4:3">4:3<span class="sub">Classic</span></button>
+        <button class="crop-preset-btn" data-ratio="3:4">3:4<span class="sub">Portrait</span></button>
+        <button class="crop-preset-btn crop-free-btn" data-ratio="free"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:0 auto 1px"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/><circle cx="4" cy="4" r="1.5" fill="currentColor"/><circle cx="20" cy="4" r="1.5" fill="currentColor"/><circle cx="4" cy="20" r="1.5" fill="currentColor"/><circle cx="20" cy="20" r="1.5" fill="currentColor"/></svg><span class="sub" style="margin-top:-2px">Free form</span></button>
+      </div>
+      <div class="crop-info" id="cropInfo">Select a ratio or click <strong>Free form</strong> then drag to extract or adjust.</div>
+      <div class="crop-btns">
+        <button class="btn btn-secondary btn-sm" id="resetCropBtn" disabled>↺ Reset</button>
+        <button class="btn btn-primary btn-sm" id="applyCropBtn" disabled>✓ Apply</button>
+      </div>
+    </div>
+    <div class="sec">
+      <div class="sec-title">Image Info</div>
+      <div class="info-grid">
+        <div class="info-row"><span class="info-key">Dimensions</span><span class="info-val" id="infoSize">—</span></div>
+        <div class="info-row"><span class="info-key">File Size</span><span class="info-val" id="infoFileSize">—</span></div>
+        <div class="info-row"><span class="info-key">Watermark</span><span class="info-val" id="infoWatermark">—</span></div>
+        <div class="info-row"><span class="info-key">Alpha Map</span><span class="info-val" id="infoAlpha">—</span></div>
+      </div>
+    </div>
+    <div class="sec" style="margin-top:auto">
+      <div class="btn-col">
+        <button class="btn btn-primary" id="downloadBtn" disabled>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download
+        </button>
+        <button class="btn btn-secondary" id="copyBtn" disabled>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy Image
+        </button>
+      </div>
+    </div>
+  </aside>
+  <main>
+    <div class="toolbar">
+      <button class="tb-btn active" id="toolView"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> View</button>
+      <button class="tb-btn" id="toolCrop"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 2 6 18 22 18"/><polyline points="2 6 18 6 18 22"/></svg> Crop</button>
+      <button class="tb-btn" id="compareBtn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="12" y1="3" x2="12" y2="21"></line></svg> Compare</button>
+      <div class="tb-sep"></div>
+      <div class="zoom-group">
+        <button class="zoom-icon-btn" id="zoomOutBtn"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg></button>
+        <input type="range" id="zoomSlider" min="10" max="400" value="100" step="5">
+        <button class="zoom-icon-btn" id="zoomInBtn"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg></button>
+        <span class="zoom-val" id="zoomVal" title="Click to Fit Image">100%</span>
+      </div>
+    </div>
+    <div class="canvas-wrapper" id="canvasWrapper">
+      <div class="canvas-container mode-view" id="canvasContainer">
+        <canvas id="mainCanvas"></canvas>
+        <canvas id="cropCanvas"></canvas>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="editor.js"></script>
+</body>
+</html>
