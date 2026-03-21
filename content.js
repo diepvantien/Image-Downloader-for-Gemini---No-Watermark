@@ -55,17 +55,36 @@ function injectButtons(img) {
   function handleAction(btn, mode) {
     const url = resolveImageUrl(img);
     if (!url) { alert('[GWR] Failed to retrieve image URL'); return; }
+
+    // Fallback if extension context is invalidated
+    if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) {
+       alert('Extension context invalidated. Please refresh the page.');
+       return;
+    }
+
     btn.disabled = true;
     btn.querySelector('span').textContent = '⏳ Loading...';
-    chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: url, mode }, (res) => {
+    try {
+      chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: url, mode }, (res) => {
+        btn.disabled = false;
+        btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit';
+        if (chrome.runtime.lastError) {
+          console.error('[GWR]', chrome.runtime.lastError.message);
+          btn.querySelector('span').textContent = '✗ Error';
+          setTimeout(() => { btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit'; }, 2500);
+          return;
+        }
+        if (!res?.ok) {
+          btn.querySelector('span').textContent = '✗ Error';
+          setTimeout(() => { btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit'; }, 2500);
+          console.error('[GWR]', res?.error);
+        }
+      });
+    } catch (err) {
       btn.disabled = false;
       btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit';
-      if (!res?.ok) {
-        btn.querySelector('span').textContent = '✗ Error';
-        setTimeout(() => { btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit'; }, 2500);
-        console.error('[GWR]', res?.error);
-      }
-    });
+      alert('Connection error. Please refresh the page to try again.');
+    }
   }
 
   dlBtn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); handleAction(dlBtn, 'download'); });
