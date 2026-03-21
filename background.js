@@ -67,8 +67,10 @@ function normalizeUrl(url) {
     if (path.includes('=')) {
       path = path.split('=')[0]; 
     }
-    // Force true original dimensions and format
-    parsed.pathname = path + '=s0-d';
+    // Force true original dimensions and format (can cause CORS with /rd-gg-dl/ sometimes)
+    // parsed.pathname = path + '=s0-d';
+    // We stick with the basic image to prevent Chrome preventing redirects.
+    parsed.pathname = path;
     return parsed.toString();
   } catch { 
     return url; 
