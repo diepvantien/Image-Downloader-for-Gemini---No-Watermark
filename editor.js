@@ -33,6 +33,10 @@ const HALO_OUTER_MARGIN = 3;
 const ALPHA_GAIN_CANDIDATES = Object.freeze([
   1.05, 1.12, 1.2, 1.28, 1.36, 1.45, 1.52, 1.6, 1.7, 1.85, 2.0
 ]);
+const OUTLINE_REFINEMENT_THRESHOLD = 0.1;
+const OUTLINE_REFINEMENT_MIN_GAIN = 1.12;
+const SUBPIXEL_REFINE_SHIFTS = Object.freeze([-0.3, 0, 0.3]);
+const SUBPIXEL_REFINE_SCALES = Object.freeze([0.99, 1, 1.01]);
 const EDGE_CLEANUP_PRESETS = Object.freeze([
   { minAlpha: 0.03, maxAlpha: 0.45, radius: 2, strength: 0.7, outsideAlphaMax: 0.05 },
   { minAlpha: 0.06, maxAlpha: 0.58, radius: 3, strength: 0.75, outsideAlphaMax: 0.08 },
@@ -395,6 +399,47 @@ function interpolateAlphaMap(sourceAlpha, sourceSize, targetSize) {
       const top = p00 + (p10 - p00) * fx;
       const bottom = p01 + (p11 - p01) * fx;
       out[y * targetSize + x] = top + (bottom - top) * fy;
+    }
+  }
+
+  return out;
+}
+
+function warpAlphaMap(alphaMap, size, { dx = 0, dy = 0, scale = 1 } = {}) {
+  if (size <= 0) return new Float32Array(0);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(scale) || scale <= 0) {
+    return new Float32Array(0);
+  }
+  if (dx === 0 && dy === 0 && scale === 1) return new Float32Array(alphaMap);
+
+  const sample = (x, y) => {
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const fx = x - x0;
+    const fy = y - y0;
+
+    const ix0 = clamp(x0, 0, size - 1);
+    const iy0 = clamp(y0, 0, size - 1);
+    const ix1 = clamp(x0 + 1, 0, size - 1);
+    const iy1 = clamp(y0 + 1, 0, size - 1);
+
+    const p00 = alphaMap[iy0 * size + ix0];
+    const p10 = alphaMap[iy0 * size + ix1];
+    const p01 = alphaMap[iy1 * size + ix0];
+    const p11 = alphaMap[iy1 * size + ix1];
+
+    const top = p00 + (p10 - p00) * fx;
+    const bottom = p01 + (p11 - p01) * fx;
+    return top + (bottom - top) * fy;
+  };
+
+  const out = new Float32Array(size * size);
+  const c = (size - 1) / 2;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const sx = (x - c) / scale + c + dx;
+      const sy = (y - c) / scale + c + dy;
+      out[y * size + x] = sample(sx, sy);
     }
   }
 
@@ -835,6 +880,81 @@ function recalibrateAlphaStrength({
   };
 }
 
+function refineSubpixelOutline({
+  sourceImageData,
+  alphaMap,
+  position,
+  alphaGain,
+  baselineSpatialScore,
+  baselineGradientScore,
+  minGain = OUTLINE_REFINEMENT_MIN_GAIN,
+  shiftCandidates = SUBPIXEL_REFINE_SHIFTS,
+  scaleCandidates = SUBPIXEL_REFINE_SCALES,
+  minGradientImprovement = 0.01,
+  maxSpatialDrift = 0.08
+}) {
+  const size = position.width;
+  if (!size || size <= 8) return null;
+  if (alphaGain < minGain) return null;
+
+  const baselineNearBlackRatio = calculateNearBlackRatio(sourceImageData, position);
+  const maxAllowedNearBlackRatio = Math.min(1, baselineNearBlackRatio + MAX_NEAR_BLACK_RATIO_INCREASE);
+  const gainCandidates = [alphaGain];
+  const lower = Math.max(1, Number((alphaGain - 0.01).toFixed(2)));
+  const upper = Number((alphaGain + 0.01).toFixed(2));
+  if (lower !== alphaGain) gainCandidates.push(lower);
+  if (upper !== alphaGain) gainCandidates.push(upper);
+
+  let best = null;
+  for (const scale of scaleCandidates) {
+    for (const dy of shiftCandidates) {
+      for (const dx of shiftCandidates) {
+        const warped = warpAlphaMap(alphaMap, size, { dx, dy, scale });
+        for (const gain of gainCandidates) {
+          const candidate = cloneImageData(sourceImageData);
+          const touched = removeWatermarkInPlace(candidate, warped, position, gain);
+          if (touched <= 0) continue;
+
+          const nearBlackRatio = calculateNearBlackRatio(candidate, position);
+          if (nearBlackRatio > maxAllowedNearBlackRatio) continue;
+
+          const spatialScore = computeRegionSpatialCorrelation({
+            imageData: candidate,
+            alphaMap: warped,
+            region: { x: position.x, y: position.y, size }
+          });
+          const gradientScore = computeRegionGradientCorrelation({
+            imageData: candidate,
+            alphaMap: warped,
+            region: { x: position.x, y: position.y, size }
+          });
+
+          const cost = Math.abs(spatialScore) * 0.6 + Math.max(0, gradientScore);
+          if (!best || cost < best.cost) {
+            best = {
+              imageData: candidate,
+              alphaMap: warped,
+              alphaGain: gain,
+              spatialScore,
+              gradientScore,
+              shift: { dx, dy, scale },
+              cost
+            };
+          }
+        }
+      }
+    }
+  }
+
+  if (!best) return null;
+
+  const improvedGradient = best.gradientScore <= baselineGradientScore - minGradientImprovement;
+  const keptSpatial = Math.abs(best.spatialScore) <= Math.abs(baselineSpatialScore) + maxSpatialDrift;
+  if (!improvedGradient || !keptSpatial) return null;
+
+  return best;
+}
+
 function blendResidualEdge({
   sourceImageData,
   alphaMap,
@@ -1111,6 +1231,27 @@ async function applyWatermarkRemoval(src) {
       finalMetrics = {
         spatialScore: recalibrated.spatialScore,
         gradientScore: recalibrated.gradientScore
+      };
+    }
+  }
+
+  const shouldRefineSubpixel =
+    finalMetrics.gradientScore >= OUTLINE_REFINEMENT_THRESHOLD &&
+    Math.abs(finalMetrics.spatialScore) <= 0.35;
+  if (shouldRefineSubpixel) {
+    const refinedSubpixel = refineSubpixelOutline({
+      sourceImageData: finalImageData,
+      alphaMap,
+      position: region,
+      alphaGain: 1.12,
+      baselineSpatialScore: finalMetrics.spatialScore,
+      baselineGradientScore: finalMetrics.gradientScore
+    });
+    if (refinedSubpixel) {
+      finalImageData = refinedSubpixel.imageData;
+      finalMetrics = {
+        spatialScore: refinedSubpixel.spatialScore,
+        gradientScore: refinedSubpixel.gradientScore
       };
     }
   }
