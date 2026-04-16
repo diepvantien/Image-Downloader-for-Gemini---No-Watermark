@@ -372,6 +372,92 @@ function getAlphaMapForRule(rule, alpha48, alpha96) {
   return alpha96 ? interpolateAlphaMap(alpha96, 96, rule.size) : null;
 }
 
+function findBestAnchorForRule({
+  imageData,
+  rule,
+  alphaMap,
+  searchRadius
+}) {
+  if (!imageData || !rule || !alphaMap) return null;
+
+  const expectedRegion = calculateWatermarkPosition(imageData.width, imageData.height, rule);
+  if (!isRegionInsideImage(imageData, expectedRegion)) return null;
+
+  const radius = Number.isFinite(searchRadius)
+    ? Math.max(0, Math.round(searchRadius))
+    : Math.max(6, Math.round(rule.size * 0.33));
+  const coarseStep = rule.size >= 80 ? 2 : 1;
+
+  const evaluateRegion = (x, y) => {
+    const region = { x, y, width: rule.size, height: rule.size };
+    if (!isRegionInsideImage(imageData, region)) return null;
+
+    const score = computeRegionSpatialCorrelation({
+      imageData,
+      alphaMap,
+      region: { x: region.x, y: region.y, size: region.width }
+    });
+
+    return { region, score };
+  };
+
+  let best = evaluateRegion(expectedRegion.x, expectedRegion.y);
+  if (!best) return null;
+
+  let bestDx = 0;
+  let bestDy = 0;
+
+  for (let dy = -radius; dy <= radius; dy += coarseStep) {
+    for (let dx = -radius; dx <= radius; dx += coarseStep) {
+      if (dx === 0 && dy === 0) continue;
+
+      const candidate = evaluateRegion(expectedRegion.x + dx, expectedRegion.y + dy);
+      if (!candidate) continue;
+
+      const bestDistance = Math.abs(bestDx) + Math.abs(bestDy);
+      const candidateDistance = Math.abs(dx) + Math.abs(dy);
+      const improvedScore = candidate.score > best.score + EPSILON;
+      const tieBreakCloser =
+        Math.abs(candidate.score - best.score) <= EPSILON && candidateDistance < bestDistance;
+
+      if (improvedScore || tieBreakCloser) {
+        best = candidate;
+        bestDx = dx;
+        bestDy = dy;
+      }
+    }
+  }
+
+  if (coarseStep > 1) {
+    for (let dy = bestDy - (coarseStep - 1); dy <= bestDy + (coarseStep - 1); dy++) {
+      for (let dx = bestDx - (coarseStep - 1); dx <= bestDx + (coarseStep - 1); dx++) {
+        const candidate = evaluateRegion(expectedRegion.x + dx, expectedRegion.y + dy);
+        if (!candidate) continue;
+
+        const bestDistance = Math.abs(bestDx) + Math.abs(bestDy);
+        const candidateDistance = Math.abs(dx) + Math.abs(dy);
+        const improvedScore = candidate.score > best.score + EPSILON;
+        const tieBreakCloser =
+          Math.abs(candidate.score - best.score) <= EPSILON && candidateDistance < bestDistance;
+
+        if (improvedScore || tieBreakCloser) {
+          best = candidate;
+          bestDx = dx;
+          bestDy = dy;
+        }
+      }
+    }
+  }
+
+  return {
+    rule,
+    region: best.region,
+    score: best.score,
+    shiftX: bestDx,
+    shiftY: bestDy
+  };
+}
+
 function resolveInitialStandardRule({
   imageData,
   defaultRule,
@@ -399,41 +485,43 @@ function resolveInitialStandardRule({
     }
   }
 
-  let bestRule = null;
-  let bestScore = Number.NEGATIVE_INFINITY;
+  let bestMatch = null;
 
   for (const candidateRule of candidateRules) {
-    const candidateRegion = calculateWatermarkPosition(imageData.width, imageData.height, candidateRule);
-    if (!isRegionInsideImage(imageData, candidateRegion)) continue;
-
     const alphaMap = getAlphaMapForRule(candidateRule, alpha48, alpha96);
     if (!alphaMap) continue;
 
-    const candidateScore = computeRegionSpatialCorrelation({
+    const candidateMatch = findBestAnchorForRule({
       imageData,
+      rule: candidateRule,
       alphaMap,
-      region: {
-        x: candidateRegion.x,
-        y: candidateRegion.y,
-        size: candidateRegion.width
-      }
+      searchRadius: Math.max(6, Math.round(candidateRule.size * 0.33))
     });
+    if (!candidateMatch) continue;
 
-    if (!bestRule) {
-      bestRule = candidateRule;
-      bestScore = candidateScore;
+    const candidateScore = candidateMatch.score;
+
+    if (!bestMatch) {
+      bestMatch = candidateMatch;
       continue;
     }
 
-    const bestIsLowConfidence = bestScore < minSwitchScore;
-    const betterByDelta = candidateScore > bestScore + minScoreDelta;
-    if ((bestIsLowConfidence && candidateScore > bestScore) || betterByDelta) {
-      bestRule = candidateRule;
-      bestScore = candidateScore;
+    const bestIsLowConfidence = bestMatch.score < minSwitchScore;
+    const betterByDelta = candidateScore > bestMatch.score + minScoreDelta;
+    if ((bestIsLowConfidence && candidateScore > bestMatch.score) || betterByDelta) {
+      bestMatch = candidateMatch;
     }
   }
 
-  return bestRule ?? defaultRule;
+  if (bestMatch) return bestMatch;
+
+  return {
+    rule: defaultRule,
+    region: calculateWatermarkPosition(imageData.width, imageData.height, defaultRule),
+    score: Number.NEGATIVE_INFINITY,
+    shiftX: 0,
+    shiftY: 0
+  };
 }
 
 async function applyWatermarkRemoval(src) {
@@ -444,15 +532,17 @@ async function applyWatermarkRemoval(src) {
   const alpha96 = await loadAlphaMap(96);
 
   const defaultRule = detectWatermarkRule(W, H);
-  const rule = resolveInitialStandardRule({
+  const resolvedRule = resolveInitialStandardRule({
     imageData: src,
     defaultRule,
     alpha48,
     alpha96
   });
 
+  const rule = resolvedRule.rule;
+
   const alphaMap = getAlphaMapForRule(rule, alpha48, alpha96);
-  const region = calculateWatermarkPosition(W, H, rule);
+  const region = resolvedRule.region;
 
   setStatus('loading', 'Processing image...');
   const out = new ImageData(new Uint8ClampedArray(src.data), W, H);
