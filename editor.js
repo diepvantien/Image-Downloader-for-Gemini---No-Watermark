@@ -23,9 +23,9 @@ const MAX_NEAR_BLACK_RATIO_INCREASE = 0.05;
 const EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT = 0.012;
 const EDGE_CLEANUP_MAX_SPATIAL_DRIFT = 0.08;
 const EDGE_CLEANUP_HALO_MIN_REDUCTION = 1.0;
-const RESIDUAL_RECALIBRATION_THRESHOLD = 0.48;
-const MIN_SUPPRESSION_FOR_SKIP_RECALIBRATION = 0.16;
-const MIN_RECALIBRATION_SCORE_DELTA = 0.06;
+const RESIDUAL_RECALIBRATION_THRESHOLD = 0.24;
+const MIN_SUPPRESSION_FOR_SKIP_RECALIBRATION = 0.10;
+const MIN_RECALIBRATION_SCORE_DELTA = 0.03;
 const HALO_MIN_ALPHA = 0.12;
 const HALO_MAX_ALPHA = 0.35;
 const HALO_OUTSIDE_ALPHA_MAX = 0.01;
@@ -1091,6 +1091,61 @@ function refineResidualEdge({
   return best;
 }
 
+function evaluateCandidateMatchQuality({
+  imageData,
+  candidateMatch,
+  alphaMap
+}) {
+  if (!imageData || !candidateMatch || !alphaMap) return null;
+
+  const region = candidateMatch.region;
+  const beforeMetrics = scoreRegion(imageData, alphaMap, region);
+  const beforeHalo = assessAlphaBandHalo({
+    imageData,
+    position: region,
+    alphaMap
+  });
+
+  const trialImage = cloneImageData(imageData);
+  const touched = removeWatermarkInPlace(trialImage, alphaMap, region, 1);
+  if (touched <= 0) return null;
+
+  const afterMetrics = scoreRegion(trialImage, alphaMap, region);
+  const afterHalo = assessAlphaBandHalo({
+    imageData: trialImage,
+    position: region,
+    alphaMap
+  });
+
+  const suppressionGain = Math.abs(beforeMetrics.spatialScore) - Math.abs(afterMetrics.spatialScore);
+  const gradientGain = beforeMetrics.gradientScore - afterMetrics.gradientScore;
+  const haloGain = beforeHalo.positiveDeltaLum - afterHalo.positiveDeltaLum;
+
+  const strongRegression =
+    Math.abs(afterMetrics.spatialScore) > Math.abs(beforeMetrics.spatialScore) + 0.1 &&
+    afterMetrics.gradientScore > beforeMetrics.gradientScore + 0.05;
+  if (strongRegression) return null;
+
+  const qualityScore =
+    suppressionGain * 1.25 +
+    gradientGain * 0.9 +
+    haloGain * 0.08 +
+    candidateMatch.score * 0.25;
+  const residualCost =
+    Math.abs(afterMetrics.spatialScore) * 0.62 +
+    Math.max(0, afterMetrics.gradientScore) +
+    afterHalo.positiveDeltaLum * 0.02;
+
+  return {
+    candidateMatch,
+    qualityScore,
+    residualCost,
+    suppressionGain,
+    gradientGain,
+    haloGain
+  };
+}
+
 function resolveInitialStandardRule({
   imageData,
   defaultRule,
@@ -1116,7 +1171,7 @@ function resolveInitialStandardRule({
     defaultRule
   });
 
-  let bestMatch = null;
+  let bestEvaluation = null;
 
   for (const candidateRule of candidateRules) {
     const alphaMap = getAlphaMapForRule(candidateRule, alpha48, alpha96);
@@ -1130,21 +1185,29 @@ function resolveInitialStandardRule({
     });
     if (!candidateMatch) continue;
 
-    const candidateScore = candidateMatch.score;
+    const evaluation = evaluateCandidateMatchQuality({
+      imageData,
+      candidateMatch,
+      alphaMap
+    });
+    if (!evaluation) continue;
 
-    if (!bestMatch) {
-      bestMatch = candidateMatch;
+    if (!bestEvaluation) {
+      bestEvaluation = evaluation;
       continue;
     }
 
-    const bestIsLowConfidence = bestMatch.score < minSwitchScore;
-    const betterByDelta = candidateScore > bestMatch.score + minScoreDelta;
-    if ((bestIsLowConfidence && candidateScore > bestMatch.score) || betterByDelta) {
-      bestMatch = candidateMatch;
+    const betterQuality = evaluation.qualityScore > bestEvaluation.qualityScore + minScoreDelta;
+    const sameQualityLowerResidual =
+      Math.abs(evaluation.qualityScore - bestEvaluation.qualityScore) <= minScoreDelta &&
+      evaluation.residualCost < bestEvaluation.residualCost - 0.01;
+
+    if (betterQuality || sameQualityLowerResidual) {
+      bestEvaluation = evaluation;
     }
   }
 
-  if (bestMatch) return bestMatch;
+  if (bestEvaluation) return bestEvaluation.candidateMatch;
 
   return {
     rule: defaultRule,
@@ -1256,10 +1319,13 @@ async function applyWatermarkRemoval(src) {
     }
   }
 
-  const shouldRefineEdges =
-    finalMetrics.gradientScore > 0.08 ||
-    Math.abs(finalMetrics.spatialScore) > 0.12;
-  if (shouldRefineEdges) {
+  for (let round = 0; round < 2; round++) {
+    const shouldRefineEdges =
+      finalMetrics.gradientScore > 0.08 ||
+      Math.abs(finalMetrics.spatialScore) > 0.12;
+    if (!shouldRefineEdges) break;
+
+    const beforeCost = Math.abs(finalMetrics.spatialScore) * 0.62 + Math.max(0, finalMetrics.gradientScore);
     const refined = refineResidualEdge({
       sourceImageData: finalImageData,
       alphaMap,
@@ -1267,13 +1333,16 @@ async function applyWatermarkRemoval(src) {
       baselineSpatialScore: finalMetrics.spatialScore,
       baselineGradientScore: finalMetrics.gradientScore
     });
-    if (refined) {
-      finalImageData = refined.imageData;
-      finalMetrics = {
-        spatialScore: refined.spatialScore,
-        gradientScore: refined.gradientScore
-      };
-    }
+    if (!refined) break;
+
+    finalImageData = refined.imageData;
+    finalMetrics = {
+      spatialScore: refined.spatialScore,
+      gradientScore: refined.gradientScore
+    };
+
+    const afterCost = Math.abs(finalMetrics.spatialScore) * 0.62 + Math.max(0, finalMetrics.gradientScore);
+    if (beforeCost - afterCost < 0.005) break;
   }
 
   const suppressionGain = Math.abs(baseline.spatialScore) - Math.abs(finalMetrics.spatialScore);
