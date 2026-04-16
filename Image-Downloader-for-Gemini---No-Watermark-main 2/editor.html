@@ -103,14 +103,6 @@
   .canvas-container.mode-view{cursor:default;}
   #mainCanvas{display:block;max-width:none;box-shadow:0 8px 40px rgba(0,0,0,.1),0 0 0 1px rgba(0,0,0,.05);border-radius:3px;}
   #cropCanvas{position:absolute;top:0;left:0;pointer-events:none;border-radius:3px;}
-  .canvas-container.upscaling {animation: upscalePulse 1.5s infinite alternate; pointer-events: none;}
-  @keyframes upscalePulse { 0% { opacity: 1; filter: blur(2px) grayscale(30%); transform: scale(1); } 100% { opacity: 0.8; filter: blur(4px) grayscale(50%); transform: scale(1.02); } }
-  #upscaleCenterOverlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; z-index: 100; pointer-events: none; opacity: 0; transition: opacity 0.3s; background: rgba(0,0,0,0.6); padding: 30px 40px; border-radius: 12px; backdrop-filter: blur(8px); box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
-  #upscaleCenterOverlay.show { opacity: 1; }
-  .upscale-center-spinner { width: 40px; height: 40px; border: 4px solid rgba(255,255,255,0.2); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; }
-  .upscale-center-text { color: #fff; font-size: 18px; font-weight: 600; letter-spacing: 0.5px; animation: pulseText 1.5s infinite alternate; }
-  .upscale-center-subtext { color: rgba(255,255,255,0.7); font-size: 13px; text-align: center; }
-  @keyframes pulseText { 0% { opacity: 0.7; transform: scale(0.98); } 100% { opacity: 1; transform: scale(1.02); } }
   #loadingOverlay{position:fixed;inset:0;background:rgba(253,246,227,.93);backdrop-filter:blur(14px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;z-index:1000;}
   #loadingOverlay.hidden{display:none;}
   .spinner{width:34px;height:34px;border:3px solid rgba(196,115,53,.2);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
@@ -178,15 +170,6 @@
         <div class="info-row"><span class="info-key">Alpha Map</span><span class="info-val" id="infoAlpha">—</span></div>
       </div>
     </div>
-    <div class="sec">
-      <div class="sec-title">AI Upscale</div>
-      <div class="fmt-grid" style="grid-template-columns:1fr 1fr;">
-        <button class="fmt-btn active" id="scale2xBtn">2x</button>
-        <button class="fmt-btn" id="scale4xBtn">4x</button>
-      </div>
-      <button class="btn btn-primary btn-sm" id="doUpscaleBtn" style="margin-top:8px; width:100%">Upscale Image</button>
-      <div class="crop-info" style="margin-top:8px; display:none;" id="upscaleInfo"></div>
-    </div>
     <div class="sec" style="margin-top:auto">
       <div class="btn-col">
         <button class="btn btn-primary" id="downloadBtn" disabled>
@@ -198,7 +181,7 @@
       </div>
     </div>
   </aside>
-  <main style="position: relative;">
+  <main>
     <div class="toolbar">
       <button class="tb-btn active" id="toolView"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> View</button>
       <button class="tb-btn" id="toolCrop"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 2 6 18 22 18"/><polyline points="2 6 18 6 18 22"/></svg> Crop</button>
@@ -216,11 +199,6 @@
         <canvas id="mainCanvas"></canvas>
         <canvas id="cropCanvas"></canvas>
       </div>
-    </div>
-    <div id="upscaleCenterOverlay">
-      <div class="upscale-center-spinner"></div>
-      <div class="upscale-center-text" id="upscaleCenterText">Uploading...</div>
-      <div class="upscale-center-subtext" id="upscaleCenterSubtext">Preparing image</div>
     </div>
   </main>
 </div>

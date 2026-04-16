@@ -49,7 +49,7 @@ document.addEventListener('DOMContentLoaded', () => {
           }
 
           // Open editor tab automatically
-          let url = chrome.runtime.getURL('editor.html') + '?key=' + res.key + '&local=1';
+          let url = chrome.runtime.getURL('editor.html') + '?key=' + res.key;
           chrome.tabs.create({ url, active: true });
           
           // Close popup

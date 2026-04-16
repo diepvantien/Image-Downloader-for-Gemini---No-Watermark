@@ -1,11 +1,21 @@
 'use strict';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const WATERMARK_RULES = {
-  large:  { size: 96, marginRight: 64, marginBottom: 64 },
-  normal: { size: 48, marginRight: 32, marginBottom: 32 }
-};
-const MAX_ALPHA = 0.98;
+const WATERMARK_RULES = Object.freeze({
+  large: Object.freeze({ size: 96, marginRight: 64, marginBottom: 64 }),
+  normal: Object.freeze({ size: 48, marginRight: 32, marginBottom: 32 })
+});
+const WATERMARK_CONFIG_BY_TIER = Object.freeze({
+  '0.5k': WATERMARK_RULES.normal,
+  '1k': WATERMARK_RULES.normal,
+  '2k': WATERMARK_RULES.normal,
+  '4k': WATERMARK_RULES.normal
+});
+const MAX_ALPHA = 0.99;
+const ALPHA_NOISE_FLOOR = 3 / 255;
+const ALPHA_THRESHOLD = 0.002;
+const LOGO_VALUE = 255;
+const EPSILON = 1e-8;
 const ALPHA_CACHE = {};
 const ALPHA_MAP_URLS = {
   48: 'https://cdn.jsdelivr.net/gh/GargantuaX/gemini-watermark-remover@main/src/assets/bg_48.png',
@@ -17,11 +27,51 @@ const ALPHA_MAP_FALLBACKS = {
 };
 const CROP_RATIOS = { '1:1': 1, '16:9': 16/9, '9:16': 9/16, '4:3': 4/3, '3:4': 3/4 };
 
+function createCatalogEntries(resolutionTier, rows) {
+  return rows.map(([width, height]) => ({ resolutionTier, width, height }));
+}
+
+const OFFICIAL_GEMINI_IMAGE_SIZES = Object.freeze([
+  ...createCatalogEntries('0.5k', [
+    [512, 512], [256, 1024], [192, 1536], [424, 632], [632, 424],
+    [448, 600], [1024, 256], [600, 448], [464, 576], [576, 464],
+    [1536, 192], [384, 688], [688, 384], [792, 168]
+  ]),
+  ...createCatalogEntries('1k', [
+    [1024, 1024], [512, 2064], [352, 2928], [848, 1264], [1264, 848],
+    [896, 1200], [2064, 512], [1200, 896], [928, 1152], [1152, 928],
+    [2928, 352], [768, 1376], [1376, 768], [1408, 768], [1584, 672]
+  ]),
+  ...createCatalogEntries('2k', [
+    [2048, 2048], [512, 2048], [384, 3072], [1696, 2528], [2528, 1696],
+    [1792, 2400], [2048, 512], [2400, 1792], [1856, 2304], [2304, 1856],
+    [3072, 384], [1536, 2752], [2752, 1536], [3168, 1344]
+  ]),
+  ...createCatalogEntries('4k', [
+    [4096, 4096], [2048, 8192], [1536, 12288], [3392, 5056], [5056, 3392],
+    [3584, 4800], [8192, 2048], [4800, 3584], [3712, 4608], [4608, 3712],
+    [12288, 1536], [3072, 5504], [5504, 3072], [6336, 2688]
+  ]),
+  ...createCatalogEntries('1k', [
+    [1024, 1024], [832, 1248], [1248, 832], [864, 1184], [1184, 864],
+    [896, 1152], [1152, 896], [768, 1344], [1344, 768], [1536, 672]
+  ])
+]);
+
+const OFFICIAL_GEMINI_IMAGE_SIZE_INDEX = new Map(
+  OFFICIAL_GEMINI_IMAGE_SIZES.map((entry) => [
+    `${entry.width}x${entry.height}`,
+    WATERMARK_CONFIG_BY_TIER[entry.resolutionTier] || WATERMARK_RULES.normal
+  ])
+);
+
 // ── State ─────────────────────────────────────────────────────────────────────
 const state = {
   originalImageData: null,
   processedImageData: null,
   currentImageData: null,
+  compareBeforeImageData: null,
+  compareAfterImageData: null,
   imgWidth: 0, imgHeight: 0,
   watermarkRule: null,
   removeWatermark: true,
@@ -34,7 +84,14 @@ const state = {
   cropStart: null,
   compareMode: false,
   fileSizeBytes: 0,
+  upscaledPreviewBitmap: null,
+  upscaledPreviewBlobSize: 0,
+  useUpscaledPreviewBitmap: false,
+  canvasDpr: 1,
+  canvasDisplayWidth: 0,
+  canvasDisplayHeight: 0,
 };
+let infoFileSizeRequestId = 0;
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -42,6 +99,44 @@ const mainCanvas = $('mainCanvas'), cropCanvas = $('cropCanvas');
 const ctx = mainCanvas.getContext('2d'), cropCtx = cropCanvas.getContext('2d');
 const canvasWrapper = $('canvasWrapper'), canvasContainer = $('canvasContainer');
 const loadingOverlay = $('loadingOverlay');
+
+function releaseUpscaledPreviewBitmap() {
+  if (state.upscaledPreviewBitmap) {
+    try {
+      state.upscaledPreviewBitmap.close();
+    } catch (_) {
+      // Ignore close errors from already-released bitmap handles.
+    }
+  }
+  state.upscaledPreviewBitmap = null;
+  state.upscaledPreviewBlobSize = 0;
+  state.useUpscaledPreviewBitmap = false;
+}
+
+function cloneImageData(source) {
+  if (!source) return null;
+  return new ImageData(new Uint8ClampedArray(source.data), source.width, source.height);
+}
+
+function setupCanvasResolution(displayWidth, displayHeight) {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  state.canvasDpr = dpr;
+  state.canvasDisplayWidth = displayWidth;
+  state.canvasDisplayHeight = displayHeight;
+
+  mainCanvas.style.width = `${displayWidth}px`;
+  mainCanvas.style.height = `${displayHeight}px`;
+  cropCanvas.style.width = `${displayWidth}px`;
+  cropCanvas.style.height = `${displayHeight}px`;
+
+  mainCanvas.width = Math.max(1, Math.round(displayWidth * dpr));
+  mainCanvas.height = Math.max(1, Math.round(displayHeight * dpr));
+  cropCanvas.width = mainCanvas.width;
+  cropCanvas.height = mainCanvas.height;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cropCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
 
 // ── Alpha map ─────────────────────────────────────────────────────────────────
 async function loadAlphaMap(size) {
@@ -65,26 +160,324 @@ async function loadAlphaMap(size) {
   throw new Error(`Cannot load alpha map ${size}×${size}`);
 }
 
-async function applyWatermarkRemoval(src) {
-  const { width: W, height: H } = src;
-  const rule = (W > 1024 && H > 1024) ? WATERMARK_RULES.large : WATERMARK_RULES.normal;
-  setStatus('loading', `Loading alpha map ${rule.size}px…`);
-  const alphaMap = await loadAlphaMap(rule.size);
-  setStatus('loading', 'Processing image...');
-  const out = new ImageData(new Uint8ClampedArray(src.data), W, H);
-  const ox = W - rule.size - rule.marginRight;
-  const oy = H - rule.size - rule.marginBottom;
-  if (ox < 0 || oy < 0) return { imageData: out, rule, detected: false };
-  for (let row = 0; row < rule.size; row++) {
-    for (let col = 0; col < rule.size; col++) {
-      const a = Math.min(alphaMap[row * rule.size + col], MAX_ALPHA);
-      if (a <= 0.005) continue;
-      const idx = ((oy + row) * W + (ox + col)) * 4;
-      for (let c = 0; c < 3; c++)
-        out.data[idx+c] = Math.max(0, Math.min(255, Math.round((out.data[idx+c] - a*255) / (1-a))));
+function cloneRule(rule) {
+  return { size: rule.size, marginRight: rule.marginRight, marginBottom: rule.marginBottom };
+}
+
+function normalizeDimension(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const rounded = Math.round(numeric);
+  return rounded > 0 ? rounded : null;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function buildRuleKey(rule) {
+  return `${rule.size}:${rule.marginRight}:${rule.marginBottom}`;
+}
+
+function meanAndVariance(values) {
+  if (!values.length) return { mean: 0, variance: 0 };
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) sum += values[i];
+  const mean = sum / values.length;
+
+  let sq = 0;
+  for (let i = 0; i < values.length; i++) {
+    const d = values[i] - mean;
+    sq += d * d;
+  }
+  return { mean, variance: sq / values.length };
+}
+
+function normalizedCrossCorrelation(a, b) {
+  if (a.length !== b.length || a.length === 0) return 0;
+
+  const statsA = meanAndVariance(a);
+  const statsB = meanAndVariance(b);
+  const den = Math.sqrt(statsA.variance * statsB.variance) * a.length;
+  if (den < EPSILON) return 0;
+
+  let num = 0;
+  for (let i = 0; i < a.length; i++) {
+    num += (a[i] - statsA.mean) * (b[i] - statsB.mean);
+  }
+  return num / den;
+}
+
+function toRegionGrayscale(imageData, region) {
+  const { width, height, data } = imageData;
+  const size = region.size ?? Math.min(region.width, region.height);
+  if (!size || size <= 0) return new Float32Array(0);
+  if (region.x < 0 || region.y < 0 || region.x + size > width || region.y + size > height) {
+    return new Float32Array(0);
+  }
+
+  const out = new Float32Array(size * size);
+  for (let row = 0; row < size; row++) {
+    for (let col = 0; col < size; col++) {
+      const idx = ((region.y + row) * width + (region.x + col)) * 4;
+      out[row * size + col] =
+        (0.2126 * data[idx] + 0.7152 * data[idx + 1] + 0.0722 * data[idx + 2]) / 255;
     }
   }
-  return { imageData: out, rule, detected: true };
+  return out;
+}
+
+function computeRegionSpatialCorrelation({ imageData, alphaMap, region }) {
+  const patch = toRegionGrayscale(imageData, region);
+  if (patch.length === 0 || patch.length !== alphaMap.length) return 0;
+  return normalizedCrossCorrelation(patch, alphaMap);
+}
+
+function interpolateAlphaMap(sourceAlpha, sourceSize, targetSize) {
+  if (targetSize <= 0) return new Float32Array(0);
+  if (sourceSize === targetSize) return new Float32Array(sourceAlpha);
+
+  const out = new Float32Array(targetSize * targetSize);
+  const scale = (sourceSize - 1) / Math.max(1, targetSize - 1);
+
+  for (let y = 0; y < targetSize; y++) {
+    const sy = y * scale;
+    const y0 = Math.floor(sy);
+    const y1 = Math.min(sourceSize - 1, y0 + 1);
+    const fy = sy - y0;
+
+    for (let x = 0; x < targetSize; x++) {
+      const sx = x * scale;
+      const x0 = Math.floor(sx);
+      const x1 = Math.min(sourceSize - 1, x0 + 1);
+      const fx = sx - x0;
+
+      const p00 = sourceAlpha[y0 * sourceSize + x0];
+      const p10 = sourceAlpha[y0 * sourceSize + x1];
+      const p01 = sourceAlpha[y1 * sourceSize + x0];
+      const p11 = sourceAlpha[y1 * sourceSize + x1];
+
+      const top = p00 + (p10 - p00) * fx;
+      const bottom = p01 + (p11 - p01) * fx;
+      out[y * targetSize + x] = top + (bottom - top) * fy;
+    }
+  }
+
+  return out;
+}
+
+function calculateWatermarkPosition(imageWidth, imageHeight, rule) {
+  return {
+    x: imageWidth - rule.marginRight - rule.size,
+    y: imageHeight - rule.marginBottom - rule.size,
+    width: rule.size,
+    height: rule.size
+  };
+}
+
+function isRegionInsideImage(imageData, region) {
+  return region.x >= 0 &&
+    region.y >= 0 &&
+    region.x + region.width <= imageData.width &&
+    region.y + region.height <= imageData.height;
+}
+
+function resolveOfficialGeminiWatermarkRule(width, height) {
+  const normalizedWidth = normalizeDimension(width);
+  const normalizedHeight = normalizeDimension(height);
+  if (!normalizedWidth || !normalizedHeight) return null;
+  const match = OFFICIAL_GEMINI_IMAGE_SIZE_INDEX.get(`${normalizedWidth}x${normalizedHeight}`);
+  return match ? cloneRule(match) : null;
+}
+
+function resolveOfficialGeminiSearchRules(
+  width,
+  height,
+  {
+    maxRelativeAspectRatioDelta = 0.02,
+    maxScaleMismatchRatio = 0.12,
+    minLogoSize = 24,
+    maxLogoSize = 192,
+    limit = 3
+  } = {}
+) {
+  const normalizedWidth = normalizeDimension(width);
+  const normalizedHeight = normalizeDimension(height);
+  if (!normalizedWidth || !normalizedHeight) return [];
+
+  const exactRule = resolveOfficialGeminiWatermarkRule(normalizedWidth, normalizedHeight);
+  if (exactRule) return [exactRule];
+
+  const targetAspectRatio = normalizedWidth / normalizedHeight;
+  const candidates = OFFICIAL_GEMINI_IMAGE_SIZES
+    .map((entry) => {
+      const baseRule = WATERMARK_CONFIG_BY_TIER[entry.resolutionTier] || WATERMARK_RULES.normal;
+
+      const scaleX = normalizedWidth / entry.width;
+      const scaleY = normalizedHeight / entry.height;
+      const scale = (scaleX + scaleY) / 2;
+      const entryAspectRatio = entry.width / entry.height;
+      const relativeAspectRatioDelta = Math.abs(targetAspectRatio - entryAspectRatio) / entryAspectRatio;
+      const scaleMismatchRatio = Math.abs(scaleX - scaleY) / Math.max(scaleX, scaleY);
+
+      if (relativeAspectRatioDelta > maxRelativeAspectRatioDelta) return null;
+      if (scaleMismatchRatio > maxScaleMismatchRatio) return null;
+
+      const rule = {
+        size: clamp(Math.round(baseRule.size * scale), minLogoSize, maxLogoSize),
+        marginRight: Math.max(8, Math.round(baseRule.marginRight * scaleX)),
+        marginBottom: Math.max(8, Math.round(baseRule.marginBottom * scaleY))
+      };
+
+      const x = normalizedWidth - rule.marginRight - rule.size;
+      const y = normalizedHeight - rule.marginBottom - rule.size;
+      if (x < 0 || y < 0) return null;
+
+      return {
+        rule,
+        score:
+          relativeAspectRatioDelta * 100 +
+          scaleMismatchRatio * 20 +
+          Math.abs(Math.log2(Math.max(scale, 1e-6)))
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.score - b.score);
+
+  const deduped = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = buildRuleKey(candidate.rule);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(candidate.rule);
+    if (deduped.length >= limit) break;
+  }
+
+  return deduped;
+}
+
+function detectWatermarkRule(imageWidth, imageHeight) {
+  const officialRule = resolveOfficialGeminiWatermarkRule(imageWidth, imageHeight);
+  if (officialRule) return officialRule;
+
+  if (imageWidth > 1024 && imageHeight > 1024) {
+    return cloneRule(WATERMARK_RULES.large);
+  }
+  return cloneRule(WATERMARK_RULES.normal);
+}
+
+function getAlphaMapForRule(rule, alpha48, alpha96) {
+  if (!rule) return null;
+  if (rule.size === 48) return alpha48;
+  if (rule.size === 96) return alpha96;
+  return alpha96 ? interpolateAlphaMap(alpha96, 96, rule.size) : null;
+}
+
+function resolveInitialStandardRule({
+  imageData,
+  defaultRule,
+  alpha48,
+  alpha96,
+  minSwitchScore = 0.12,
+  minScoreDelta = 0.04
+}) {
+  if (!imageData || !defaultRule || !alpha48 || !alpha96) return defaultRule;
+
+  const fallbackRule = cloneRule(WATERMARK_RULES.normal);
+  const primaryRule = defaultRule.size === 96 ? cloneRule(WATERMARK_RULES.large) : fallbackRule;
+  const alternateRule = defaultRule.size === 96 ? fallbackRule : cloneRule(WATERMARK_RULES.large);
+  const candidateRules = [primaryRule, alternateRule];
+
+  for (const officialRule of resolveOfficialGeminiSearchRules(imageData.width, imageData.height, { limit: 1 })) {
+    if (!candidateRules.some((candidate) => buildRuleKey(candidate) === buildRuleKey(officialRule))) {
+      candidateRules.push(officialRule);
+    }
+  }
+
+  let bestRule = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const candidateRule of candidateRules) {
+    const candidateRegion = calculateWatermarkPosition(imageData.width, imageData.height, candidateRule);
+    if (!isRegionInsideImage(imageData, candidateRegion)) continue;
+
+    const alphaMap = getAlphaMapForRule(candidateRule, alpha48, alpha96);
+    if (!alphaMap) continue;
+
+    const candidateScore = computeRegionSpatialCorrelation({
+      imageData,
+      alphaMap,
+      region: {
+        x: candidateRegion.x,
+        y: candidateRegion.y,
+        size: candidateRegion.width
+      }
+    });
+
+    if (!bestRule) {
+      bestRule = candidateRule;
+      bestScore = candidateScore;
+      continue;
+    }
+
+    const bestIsLowConfidence = bestScore < minSwitchScore;
+    const betterByDelta = candidateScore > bestScore + minScoreDelta;
+    if ((bestIsLowConfidence && candidateScore > bestScore) || betterByDelta) {
+      bestRule = candidateRule;
+      bestScore = candidateScore;
+    }
+  }
+
+  return bestRule ?? defaultRule;
+}
+
+async function applyWatermarkRemoval(src) {
+  const { width: W, height: H } = src;
+
+  setStatus('loading', 'Loading alpha maps…');
+  const alpha48 = await loadAlphaMap(48);
+  const alpha96 = await loadAlphaMap(96);
+
+  const defaultRule = detectWatermarkRule(W, H);
+  const rule = resolveInitialStandardRule({
+    imageData: src,
+    defaultRule,
+    alpha48,
+    alpha96
+  });
+
+  const alphaMap = getAlphaMapForRule(rule, alpha48, alpha96);
+  const region = calculateWatermarkPosition(W, H, rule);
+
+  setStatus('loading', 'Processing image...');
+  const out = new ImageData(new Uint8ClampedArray(src.data), W, H);
+
+  if (!alphaMap || !isRegionInsideImage(src, region)) {
+    return { imageData: out, rule, detected: false };
+  }
+
+  let touchedPixelCount = 0;
+  for (let row = 0; row < region.height; row++) {
+    for (let col = 0; col < region.width; col++) {
+      const rawAlpha = alphaMap[row * region.width + col];
+      const signalAlpha = Math.max(0, rawAlpha - ALPHA_NOISE_FLOOR);
+      if (signalAlpha < ALPHA_THRESHOLD) continue;
+
+      const alpha = Math.min(rawAlpha, MAX_ALPHA);
+      const oneMinusAlpha = 1.0 - alpha;
+      const idx = ((region.y + row) * W + (region.x + col)) * 4;
+
+      for (let c = 0; c < 3; c++) {
+        const watermarked = out.data[idx + c];
+        const original = (watermarked - alpha * LOGO_VALUE) / oneMinusAlpha;
+        out.data[idx + c] = Math.max(0, Math.min(255, Math.round(original)));
+      }
+      touchedPixelCount++;
+    }
+  }
+
+  return { imageData: out, rule, detected: touchedPixelCount > 0 };
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -92,26 +485,48 @@ function renderCanvas() {
   const data = state.currentImageData;
   if (!data) return;
   const { width: W, height: H } = data;
-  mainCanvas.width  = Math.round(W * state.zoom);
-  mainCanvas.height = Math.round(H * state.zoom);
-  cropCanvas.width  = mainCanvas.width;
-  cropCanvas.height = mainCanvas.height;
+  const displayWidth = Math.round(W * state.zoom);
+  const displayHeight = Math.round(H * state.zoom);
+  setupCanvasResolution(displayWidth, displayHeight);
+
+  ctx.imageSmoothingEnabled = state.zoom < 1;
+  if ('imageSmoothingQuality' in ctx) {
+    ctx.imageSmoothingQuality = 'high';
+  }
+
+  const canUseBitmapPreview =
+    state.useUpscaledPreviewBitmap &&
+    !!state.upscaledPreviewBitmap &&
+    state.currentImageData === state.originalImageData &&
+    state.currentImageData === state.processedImageData;
+
+  if (canUseBitmapPreview) {
+    // Prefer crisp detail when showing directly upscaled preview.
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, displayWidth, displayHeight);
+    ctx.drawImage(state.upscaledPreviewBitmap, 0, 0, displayWidth, displayHeight);
+    renderCropOverlay();
+    syncZoomUI();
+    return;
+  }
+
   const off = new OffscreenCanvas(W, H);
   off.getContext('2d').putImageData(data, 0, 0);
-  ctx.imageSmoothingEnabled = state.zoom < 1;
-  ctx.drawImage(off, 0, 0, mainCanvas.width, mainCanvas.height);
+  ctx.drawImage(off, 0, 0, displayWidth, displayHeight);
   renderCropOverlay();
   syncZoomUI();
 }
 
 function renderCropOverlay() {
-  cropCtx.clearRect(0, 0, cropCanvas.width, cropCanvas.height);
+  const displayWidth = state.canvasDisplayWidth || Math.round((state.imgWidth || 0) * state.zoom);
+  const displayHeight = state.canvasDisplayHeight || Math.round((state.imgHeight || 0) * state.zoom);
+  cropCtx.clearRect(0, 0, displayWidth, displayHeight);
   if (!state.cropRect) return;
   const { x, y, w, h } = state.cropRect;
   const z = state.zoom;
   const [cx, cy, cw, ch] = [x*z, y*z, w*z, h*z];
   cropCtx.fillStyle = 'rgba(0,0,0,0.52)';
-  cropCtx.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
+  cropCtx.fillRect(0, 0, displayWidth, displayHeight);
   cropCtx.clearRect(cx, cy, cw, ch);
   cropCtx.strokeStyle = 'rgba(196,115,53,.9)';
   cropCtx.lineWidth = 1.5;
@@ -129,25 +544,49 @@ function renderCropOverlay() {
 }
 
 function renderCompare(mouseX) {
-  if (!state.originalImageData || !state.processedImageData) return;
-  const { width: W, height: H } = state.originalImageData;
-  mainCanvas.width  = Math.round(W * state.zoom);
-  mainCanvas.height = Math.round(H * state.zoom);
-  const off = new OffscreenCanvas(W, H);
-  const oc = off.getContext('2d');
-  oc.putImageData(state.processedImageData, 0, 0);
-  const pb = off.transferToImageBitmap();
-  oc.putImageData(state.originalImageData, 0, 0);
-  const ob = off.transferToImageBitmap();
-  ctx.drawImage(pb, 0, 0, mainCanvas.width, mainCanvas.height);
-  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, mouseX, mainCanvas.height); ctx.clip();
-  ctx.drawImage(ob, 0, 0, mainCanvas.width, mainCanvas.height);
+  const beforeData = state.compareBeforeImageData || state.originalImageData;
+  const afterData = state.compareAfterImageData || state.processedImageData;
+  if (!beforeData || !afterData) return;
+
+  const viewW = afterData.width;
+  const viewH = afterData.height;
+  const displayWidth = Math.round(viewW * state.zoom);
+  const displayHeight = Math.round(viewH * state.zoom);
+  setupCanvasResolution(displayWidth, displayHeight);
+
+  const afterOff = new OffscreenCanvas(afterData.width, afterData.height);
+  const afterCtx = afterOff.getContext('2d');
+  afterCtx.putImageData(afterData, 0, 0);
+  const afterBitmap = afterOff.transferToImageBitmap();
+
+  const beforeOff = new OffscreenCanvas(beforeData.width, beforeData.height);
+  const beforeCtx = beforeOff.getContext('2d');
+  beforeCtx.putImageData(beforeData, 0, 0);
+  const beforeBitmap = beforeOff.transferToImageBitmap();
+
+  ctx.imageSmoothingEnabled = state.zoom < 1 || beforeData.width !== viewW || beforeData.height !== viewH;
+  if ('imageSmoothingQuality' in ctx) {
+    ctx.imageSmoothingQuality = 'high';
+  }
+
+  const splitX = Math.max(0, Math.min(mouseX, displayWidth));
+  ctx.drawImage(afterBitmap, 0, 0, displayWidth, displayHeight);
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, splitX, displayHeight); ctx.clip();
+  ctx.drawImage(beforeBitmap, 0, 0, displayWidth, displayHeight);
   ctx.restore();
+
+  beforeBitmap.close();
+  afterBitmap.close();
+
   ctx.strokeStyle = '#c47335'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.moveTo(mouseX, 0); ctx.lineTo(mouseX, mainCanvas.height); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(splitX, 0); ctx.lineTo(splitX, displayHeight); ctx.stroke();
   ctx.font = 'bold 11px -apple-system,sans-serif';
-  ctx.fillStyle='rgba(0,0,0,.72)'; ctx.fillRect(8,8,72,20); ctx.fillRect(mouseX+8,8,80,20);
-  ctx.fillStyle='#fff'; ctx.fillText('Original',12,22); ctx.fillText('Processed',mouseX+12,22);
+  ctx.fillStyle='rgba(0,0,0,.72)';
+  ctx.fillRect(8, 8, 72, 20);
+  ctx.fillRect(splitX + 8, 8, 68, 20);
+  ctx.fillStyle='#fff';
+  ctx.fillText('Before', 12, 22);
+  ctx.fillText('After', splitX + 12, 22);
 }
 
 // ── Zoom ──────────────────────────────────────────────────────────────────────
@@ -209,6 +648,7 @@ function deactivateCropMode() {
 
 function applyCrop() {
   if (!state.cropRect) return;
+  releaseUpscaledPreviewBitmap();
   const { x, y, w, h } = state.cropRect;
   const src = state.currentImageData;
   const cropped = new ImageData(w, h);
@@ -225,6 +665,8 @@ function applyCrop() {
   state.originalImageData  = cropped;
   state.processedImageData = cropped;
   state.currentImageData   = cropped;
+  state.compareBeforeImageData = cropped;
+  state.compareAfterImageData = cropped;
   state.imgWidth = w; state.imgHeight = h;
   state.cropRect = null;
   state.watermarkRule = null;
@@ -257,18 +699,44 @@ function updateInfoPanel() {
     $('infoWatermark').textContent = '—';
     $('infoAlpha').textContent = '—';
   }
-  // Estimate file size from current ImageData (uncompressed RGBA → PNG ~25% ratio)
-  if (state.currentImageData) {
-    const raw = state.currentImageData.data.byteLength;
-    const estimated = Math.round(raw * 0.22); // rough PNG estimate
-    $('infoFileSize').textContent = formatBytes(estimated) + ' (est.)';
-  }
+  updateInfoFileSize();
 }
 
 function formatBytes(b) {
   if (b < 1024) return b + ' B';
   if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
   return (b/1024/1024).toFixed(2) + ' MB';
+}
+
+function updateInfoFileSize() {
+  const el = $('infoFileSize');
+  if (!state.currentImageData) {
+    el.textContent = '—';
+    return;
+  }
+
+  const format = normalizeExportFormat(state.format);
+  const mime = EXPORT_MIME_BY_FORMAT[format] || 'image/png';
+  const q = format === 'png' ? undefined : state.quality;
+  const requestId = ++infoFileSizeRequestId;
+
+  buildOutputCanvas().toBlob(blob => {
+    if (requestId !== infoFileSizeRequestId) return;
+
+    if (blob && blob.size > 0) {
+      el.textContent = formatBytes(blob.size);
+      return;
+    }
+
+    if (Number.isFinite(state.fileSizeBytes) && state.fileSizeBytes > 0) {
+      el.textContent = formatBytes(state.fileSizeBytes);
+      return;
+    }
+
+    const raw = state.currentImageData.data.byteLength;
+    const estimated = Math.round(raw * 0.22);
+    el.textContent = formatBytes(estimated) + ' (est.)';
+  }, mime, q);
 }
 
 function setStatus(type, text) {
@@ -288,16 +756,31 @@ function buildOutputCanvas() {
   return c;
 }
 
+const EXPORT_MIME_BY_FORMAT = Object.freeze({
+  png: 'image/png',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp'
+});
+
+function normalizeExportFormat(format) {
+  if (typeof format !== 'string') return 'png';
+  const normalized = format.toLowerCase();
+  return EXPORT_MIME_BY_FORMAT[normalized] ? normalized : 'png';
+}
+
 function download() {
-  const mime = { png:'image/png', jpeg:'image/jpeg', webp:'image/webp' }[state.format];
-  const q = state.format === 'png' ? undefined : state.quality;
+  const format = normalizeExportFormat(state.format);
+  if (format !== state.format) state.format = format;
+  const mime = EXPORT_MIME_BY_FORMAT[format];
+  const q = format === 'png' ? undefined : state.quality;
+  const ext = format === 'jpeg' ? 'jpg' : format;
   buildOutputCanvas().toBlob(blob => {
     if (!blob) return alert('Cannot export image.');
     const url = URL.createObjectURL(blob);
-    Object.assign(document.createElement('a'), { href: url, download: `gemini-${Date.now()}.${state.format}` }).click();
+    Object.assign(document.createElement('a'), { href: url, download: `gemini-${Date.now()}.${ext}` }).click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-    // Update file size info with actual blob size
-    $('infoFileSize').textContent = formatBytes(blob.size);
+    state.fileSizeBytes = blob.size;
+    updateInfoPanel();
     if (new URLSearchParams(location.search).get('autoDownload') === '1') {
       setTimeout(() => window.close(), 200);
     }
@@ -325,6 +808,19 @@ async function getStoredImageData(key) {
   });
 }
 
+async function fetchUpscaledImageViaBackground(urls, retriesPerUrl = 3) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { type: 'FETCH_UPSCALED_IMAGE_FROM_URLS', urls, retriesPerUrl },
+      res => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (res?.key) return resolve(res);
+        reject(new Error(res?.error || 'Background fetch failed'));
+      }
+    );
+  });
+}
+
 async function decodeImageData(dataUrl) {
   const r = await fetch(dataUrl);
   const blob = await r.blob();
@@ -340,6 +836,7 @@ async function decodeImageData(dataUrl) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
+  releaseUpscaledPreviewBitmap();
   const params = new URLSearchParams(location.search);
   const key = params.get('key');
   const autoDownload = params.get('autoDownload') === '1';
@@ -365,6 +862,8 @@ async function init() {
     state.processedImageData = result.imageData;
     state.watermarkRule = result.detected ? result.rule : null;
     state.currentImageData = state.processedImageData;
+    state.compareBeforeImageData = state.originalImageData;
+    state.compareAfterImageData = state.processedImageData;
 
     loadingOverlay.classList.add('hidden');
     fitToWindow();
@@ -412,7 +911,12 @@ $('compareBtn').addEventListener('click', () => {
   state.compareMode = !state.compareMode;
   $('compareBtn').classList.toggle('active', state.compareMode);
   deactivateCropMode();
-  if (!state.compareMode) renderCanvas();
+  if (!state.compareMode) {
+    renderCanvas();
+  } else {
+    const splitX = Math.round((state.canvasDisplayWidth || Math.round((state.imgWidth || 0) * state.zoom)) / 2);
+    renderCompare(splitX);
+  }
 });
 
 // Crop presets
@@ -451,17 +955,19 @@ canvasWrapper.addEventListener('wheel', e => {
 }, { passive: false });
 
 // Format
-document.querySelectorAll('.fmt-btn').forEach(btn => {
+document.querySelectorAll('.fmt-btn[data-fmt]').forEach(btn => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('.fmt-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.fmt-btn[data-fmt]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    state.format = btn.dataset.fmt;
+    state.format = normalizeExportFormat(btn.dataset.fmt);
     $('qualityRow').style.display = state.format !== 'png' ? 'block' : 'none';
+    updateInfoPanel();
   });
 });
 $('qualitySlider').addEventListener('input', e => {
   state.quality = e.target.value / 100;
   $('qualityDisplay').textContent = e.target.value + '%';
+  updateInfoPanel();
 });
 
 $('toggleWatermark').addEventListener('change', e => {
@@ -472,6 +978,458 @@ $('toggleWatermark').addEventListener('change', e => {
 
 $('downloadBtn').addEventListener('click', download);
 $('copyBtn').addEventListener('click', copyToClipboard);
+
+// ── Upscale ────────────────────────────────────────────────────────
+
+let upscaleScale = '2';
+let isUpscaling = false;
+
+$('scale2xBtn').addEventListener('click', () => {
+  $('scale2xBtn').classList.add('active');
+  $('scale4xBtn').classList.remove('active');
+  upscaleScale = '2';
+});
+$('scale4xBtn').addEventListener('click', () => {
+  $('scale4xBtn').classList.add('active');
+  $('scale2xBtn').classList.remove('active');
+  upscaleScale = '4';
+});
+
+function isLikelyUpscaledImageUrl(url) {
+  if (typeof url !== 'string') return false;
+  if (!/^https?:\/\//i.test(url)) return false;
+  return /(\.(png|jpe?g|webp|bmp|gif))(\?|$)/i.test(url) || /\/upscaler\/results\/[^/]+$/i.test(url);
+}
+
+function extractUpscaleDownloadUrl(statusData, scale) {
+  const urls = extractUpscaleDownloadUrls(statusData, scale);
+  return urls.length ? urls[0] : null;
+}
+
+function extractUpscaleDownloadUrls(statusData, scale) {
+  if (!statusData || typeof statusData !== 'object') return [];
+  const data = statusData.data || {};
+  const scaleInt = parseInt(scale, 10);
+  const scaleTag = Number.isFinite(scaleInt) && scaleInt > 0 ? `_${scaleInt}x.` : null;
+
+  const urls = [];
+  const addUrl = (url) => {
+    if (!isLikelyUpscaledImageUrl(url)) return;
+    const secureUrl = String(url).trim().replace(/^http:\/\//i, 'https://');
+    if (!secureUrl || urls.includes(secureUrl)) return;
+    urls.push(secureUrl);
+  };
+
+  addUrl(data.downloadUrl);
+  if (Array.isArray(data.downloadUrls)) {
+    data.downloadUrls.forEach(addUrl);
+  }
+
+  const fallbackKeys = ['resultUrl', 'result_url', 'url', 'download', 'downloadURL'];
+  fallbackKeys.forEach((key) => addUrl(data[key]));
+
+  if (!scaleTag) return urls;
+
+  const scaleMatched = [];
+  const others = [];
+  for (const url of urls) {
+    if (url.toLowerCase().includes(scaleTag)) scaleMatched.push(url);
+    else others.push(url);
+  }
+  return [...scaleMatched, ...others];
+}
+
+function guessUpscaleDownloadUrl(code, scale, statusData) {
+  if (typeof code !== 'string' || !/^[A-Za-z0-9_-]+$/.test(code)) return null;
+  const scaleInt = parseInt(scale, 10);
+  if (!Number.isFinite(scaleInt) || scaleInt <= 0) return null;
+
+  const mimeType = String(statusData?.data?.imagemimetype || 'jpg').toLowerCase();
+  const ext = mimeType === 'jpeg' ? 'jpg' : mimeType;
+  if (!/^[a-z0-9]+$/.test(ext)) return null;
+
+  return `https://get1.imglarger.com/upscaler/results/${code}_${scaleInt}x.${ext}`;
+}
+
+function collectUpscaleDownloadCandidates(primaryUrl, code, scale, statusData) {
+  const candidates = [];
+  const addCandidate = (url) => {
+    if (typeof url !== 'string') return;
+    const secureUrl = url.trim().replace(/^http:\/\//i, 'https://');
+    if (!secureUrl || candidates.includes(secureUrl)) return;
+    candidates.push(secureUrl);
+  };
+
+  addCandidate(primaryUrl);
+  for (const url of extractUpscaleDownloadUrls(statusData, scale)) {
+    addCandidate(url);
+  }
+  addCandidate(guessUpscaleDownloadUrl(code, scale, statusData));
+
+  const scaleInt = parseInt(scale, 10);
+  if (typeof code === 'string' && /^[A-Za-z0-9_-]+$/.test(code) && Number.isFinite(scaleInt) && scaleInt > 0) {
+    ['jpg', 'jpeg', 'png', 'webp'].forEach((ext) => {
+      addCandidate(`https://get1.imglarger.com/upscaler/results/${code}_${scaleInt}x.${ext}`);
+    });
+  }
+
+  return candidates;
+}
+
+async function fetchUpscaledImageBlob(candidates, sourceWidth, sourceHeight, expectedFileSize) {
+  let bestUpscaledResult = null;
+  let firstValidResult = null;
+  const expectedSize = Number.isFinite(expectedFileSize) && expectedFileSize > 0
+    ? expectedFileSize
+    : null;
+
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) continue;
+
+      const blob = await res.blob();
+      const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+      const blobType = String(blob.type || '').toLowerCase();
+
+      if (blob.size <= 0) continue;
+      if (!contentType.startsWith('image/') && !blobType.startsWith('image/')) continue;
+
+      let bitmap;
+      try {
+        bitmap = await createImageBitmap(blob);
+      } catch (_) {
+        continue;
+      }
+
+      const width = bitmap.width;
+      const height = bitmap.height;
+      bitmap.close();
+
+      const candidate = {
+        blob,
+        url,
+        width,
+        height,
+        area: width * height,
+        sizeBytes: blob.size,
+        expectedDelta: expectedSize ? Math.abs(blob.size - expectedSize) : null,
+        expectedQualified: expectedSize ? blob.size >= expectedSize * 0.8 : false
+      };
+
+      if (!firstValidResult) firstValidResult = candidate;
+
+      const appearsUpscaled = width > sourceWidth || height > sourceHeight;
+      if (!appearsUpscaled) continue;
+
+      if (!bestUpscaledResult) {
+        bestUpscaledResult = candidate;
+        continue;
+      }
+
+      if (expectedSize) {
+        if (candidate.expectedQualified && !bestUpscaledResult.expectedQualified) {
+          bestUpscaledResult = candidate;
+          continue;
+        }
+        if (!candidate.expectedQualified && bestUpscaledResult.expectedQualified) {
+          continue;
+        }
+
+        if (candidate.expectedQualified && bestUpscaledResult.expectedQualified) {
+          if (candidate.expectedDelta < bestUpscaledResult.expectedDelta) {
+            bestUpscaledResult = candidate;
+            continue;
+          }
+          if (candidate.expectedDelta > bestUpscaledResult.expectedDelta) {
+            continue;
+          }
+        }
+      }
+
+      const largerArea = candidate.area > bestUpscaledResult.area;
+      const sameArea = candidate.area === bestUpscaledResult.area;
+      const largerSize = candidate.sizeBytes > bestUpscaledResult.sizeBytes;
+      if (largerArea || (sameArea && largerSize)) {
+        bestUpscaledResult = candidate;
+      }
+    } catch (_) {
+      // Try next candidate URL.
+    }
+  }
+
+  return bestUpscaledResult || firstValidResult;
+}
+
+async function fetchUpscaledImageBlobFromBackground(candidates, sourceWidth, sourceHeight, expectedFileSize) {
+  let fetched;
+  try {
+    fetched = await fetchUpscaledImageViaBackground(candidates, 3);
+  } catch (_) {
+    return null;
+  }
+
+  if (!fetched?.key) return null;
+
+  let dataUrl;
+  try {
+    dataUrl = await getStoredImageData(fetched.key);
+  } catch (_) {
+    return null;
+  }
+
+  let blob;
+  try {
+    const res = await fetch(dataUrl);
+    blob = await res.blob();
+  } catch (_) {
+    return null;
+  }
+
+  if (!blob || blob.size <= 0) return null;
+
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(blob);
+  } catch (_) {
+    return null;
+  }
+
+  const width = bitmap.width;
+  const height = bitmap.height;
+  bitmap.close();
+
+  const appearsUpscaled = width > sourceWidth || height > sourceHeight;
+  if (!appearsUpscaled) return null;
+
+  const expectedSize = Number.isFinite(expectedFileSize) && expectedFileSize > 0
+    ? expectedFileSize
+    : null;
+  if (expectedSize && blob.size < expectedSize * 0.75) return null;
+
+  return {
+    blob,
+    url: fetched.url || candidates[0],
+    width,
+    height,
+    area: width * height,
+    sizeBytes: blob.size,
+    fetchedByBackground: true
+  };
+}
+
+async function doUpscale() {
+  if (isUpscaling) return;
+  isUpscaling = true;
+  const beforeUpscaleImageData = cloneImageData(state.currentImageData);
+  const btn = $('doUpscaleBtn');
+  const info = $('upscaleInfo');
+  const container = $('canvasContainer');
+  const overlay = $('upscaleCenterOverlay');
+  const overText = $('upscaleCenterText');
+  const overSubtext = $('upscaleCenterSubtext');
+  
+  btn.disabled = true;
+  btn.textContent = 'Uploading...';
+  info.style.display = 'block';
+  info.textContent = 'Preparing image...';
+  container.classList.add('upscaling');
+  
+  if (overlay) {
+    overlay.classList.add('show');
+    overText.textContent = 'Preparing image...';
+    overSubtext.textContent = 'Please wait';
+  }
+
+  try {
+    const blob = await new Promise(r => buildOutputCanvas().toBlob(r, 'image/png'));
+    const formData = new FormData();
+    formData.append('myfile', blob, 'upscale.png');
+    formData.append('scaleRadio', upscaleScale);
+
+    info.textContent = 'Uploading to server...';
+    if (overlay) overText.textContent = 'Uploading to server...';
+    
+    const uploadRes = await fetch('https://get1.imglarger.com/api/UpscalerNew/UploadNew', {
+      method: 'POST',
+      body: formData
+    });
+    const uploadData = await uploadRes.json();
+    if (!uploadData?.data?.code) throw new Error(uploadData?.msg || 'Upload failed');
+
+    const code = uploadData.data.code;
+    info.textContent = 'Upscaling... (may take 1-4 minutes)';
+    if (overlay) {
+      overText.textContent = 'AI is upscaling your image...';
+      overSubtext.textContent = 'Please wait, this may take 1-4 minutes';
+    }
+
+    let downloadUrl = null;
+    let lastStatus = 'pending';
+    let latestStatusData = null;
+    const pollDelayMs = 2500;
+    const maxPollAttempts = upscaleScale === '4' ? 180 : 120;
+
+    for (let i = 0; i < maxPollAttempts; i++) {
+      await new Promise(r => setTimeout(r, pollDelayMs));
+
+      let statusRes;
+      try {
+        statusRes = await fetch('https://get1.imglarger.com/api/UpscalerNew/CheckStatusNew', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, scaleRadio: parseInt(upscaleScale, 10) })
+        });
+      } catch (_) {
+        // Keep polling if a transient network error happens.
+        continue;
+      }
+
+      const statusRaw = await statusRes.text();
+      let statusData = null;
+      try {
+        statusData = statusRaw ? JSON.parse(statusRaw) : null;
+      } catch (_) {
+        statusData = null;
+      }
+      latestStatusData = statusData;
+
+      const status = String(statusData?.data?.status || '').toLowerCase();
+      if (status) lastStatus = status;
+
+      const elapsedSec = Math.round(((i + 1) * pollDelayMs) / 1000);
+      info.textContent = `Upscaling... ${elapsedSec}s elapsed`;
+      if (overlay) {
+        overSubtext.textContent = `Please wait, elapsed ${elapsedSec}s`;
+      }
+
+      const terminalSuccessStatus = status === 'success' || status === 'done' || status === 'completed' || status === 'finished';
+
+      const candidateUrl = extractUpscaleDownloadUrl(statusData, upscaleScale);
+      if (candidateUrl) {
+        downloadUrl = candidateUrl;
+        if (terminalSuccessStatus) break;
+      }
+
+      if (terminalSuccessStatus && !downloadUrl) {
+        const guessedUrl = guessUpscaleDownloadUrl(code, upscaleScale, statusData);
+        if (guessedUrl) {
+          downloadUrl = guessedUrl;
+          break;
+        }
+      }
+
+      if (status === 'failed' || status === 'error' || status === 'cancelled') {
+        throw new Error('Upscale process failed');
+      }
+    }
+
+    if (!downloadUrl) throw new Error(`Timeout waiting for upscale (last status: ${lastStatus})`);
+
+    info.textContent = 'Downloading upscaled image...';
+    btn.textContent = 'Downloading...';
+    if (overlay) {
+      overText.textContent = 'Processing and rendering...';
+      overSubtext.textContent = 'Almost done!';
+    }
+    
+    // Load upscaled image directly into current editor to avoid background string limits
+    const sourceWidth = state.imgWidth;
+    const sourceHeight = state.imgHeight;
+    const expectedUpscaleSizeRaw = Number(latestStatusData?.data?.filesize);
+    const expectedUpscaleSize = Number.isFinite(expectedUpscaleSizeRaw) && expectedUpscaleSizeRaw > 0
+      ? expectedUpscaleSizeRaw
+      : null;
+    const candidateUrls = collectUpscaleDownloadCandidates(downloadUrl, code, upscaleScale, latestStatusData);
+    let fetchedImage = await fetchUpscaledImageBlob(candidateUrls, sourceWidth, sourceHeight, expectedUpscaleSize);
+
+    const directLooksLowQuality =
+      fetchedImage &&
+      expectedUpscaleSize &&
+      fetchedImage.sizeBytes < expectedUpscaleSize * 0.8;
+
+    if (!fetchedImage || directLooksLowQuality) {
+      const backgroundFetchedImage = await fetchUpscaledImageBlobFromBackground(
+        candidateUrls,
+        sourceWidth,
+        sourceHeight,
+        expectedUpscaleSize
+      );
+      if (backgroundFetchedImage) {
+        fetchedImage = backgroundFetchedImage;
+      }
+    }
+
+    if (!fetchedImage) throw new Error('Could not download upscaled image from server');
+
+    if (fetchedImage.width <= sourceWidth && fetchedImage.height <= sourceHeight) {
+      throw new Error(`Server returned non-upscaled image (${fetchedImage.width}x${fetchedImage.height})`);
+    }
+
+    const imgBlob = fetchedImage.blob;
+    state.fileSizeBytes = imgBlob.size;
+    
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(imgBlob);
+    } catch (_) {
+      throw new Error('Upscaled response is not a valid image');
+    }
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = bitmap.width;
+    tempCanvas.height = bitmap.height;
+    const ctx = tempCanvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+
+    releaseUpscaledPreviewBitmap();
+    state.upscaledPreviewBitmap = bitmap;
+    state.upscaledPreviewBlobSize = imgBlob.size;
+    state.useUpscaledPreviewBitmap = true;
+
+    state.originalImageData = imageData;
+    state.processedImageData = imageData; 
+    state.currentImageData = imageData;
+    state.compareBeforeImageData = beforeUpscaleImageData || state.originalImageData;
+    state.compareAfterImageData = state.currentImageData;
+    state.imgWidth = imageData.width;
+    state.imgHeight = imageData.height;
+    state.watermarkRule = null;
+    state.cropRect = null;
+    state.zoom = 1;
+    state.compareMode = false;
+    $('compareBtn').classList.remove('active');
+    
+    canvasWrapper.scrollLeft = 0;
+    canvasWrapper.scrollTop = 0;
+    fitToWindow();
+    updateInfoPanel();
+    updateCropInfo();
+
+    const exportFormat = normalizeExportFormat(state.format);
+    const exportMime = EXPORT_MIME_BY_FORMAT[exportFormat];
+    const exportQuality = exportFormat === 'png' ? undefined : state.quality;
+    const exportBlob = await new Promise(resolve => buildOutputCanvas().toBlob(resolve, exportMime, exportQuality));
+    const sizeText = exportBlob?.size
+      ? formatBytes(exportBlob.size)
+      : formatBytes(fetchedImage.sizeBytes || imgBlob.size);
+    const fetchRoute = fetchedImage.fetchedByBackground ? 'background' : 'direct';
+    info.textContent = `Upscale applied: ${sourceWidth}x${sourceHeight} -> ${imageData.width}x${imageData.height} (${sizeText}, ${fetchRoute})`;
+    setStatus('done', 'Upscaled Image');
+
+  } catch (err) {
+    info.textContent = 'Error: ' + err.message;
+    console.error('[Upscale Error]', err);
+  } finally {
+    isUpscaling = false;
+    container.classList.remove('upscaling');
+    if (overlay) overlay.classList.remove('show');
+    btn.disabled = false;
+    btn.textContent = 'Upscale Image';
+  }
+}
+
+$('doUpscaleBtn').addEventListener('click', doUpscale);
 
 // ── Canvas mouse events ────────────────────────────────────────────────────────
 

@@ -1,132 +1,167 @@
-// content.js — Injected into gemini.google.com
 
-const CONTAINER_SELECTOR = 'generated-image, .generated-image-container';
-const MIN_EDGE = 128;
-const PROCESSED_ATTR = 'gwrProcessed';
+function resolveImageUrl(imgElement) {
+  let url = imgElement.src || '';
+  if (url.startsWith('blob:')) return url;
+  if (!url.includes('googleusercontent.com')) return url;
 
-function isGoogleusercontentUrl(url) {
-  try {
-    const { hostname } = new URL(url);
-    return hostname === 'googleusercontent.com' || hostname.endsWith('.googleusercontent.com');
-  } catch { return false; }
-}
-
-function isMeaningfulSize(img) {
-  const w = Math.max(img.naturalWidth || 0, img.clientWidth || 0);
-  const h = Math.max(img.naturalHeight || 0, img.clientHeight || 0);
-  return w >= MIN_EDGE || h >= MIN_EDGE;
-}
-
-function resolveImageUrl(img) {
-  return img.currentSrc || img.src || '';
-}
-
-function isEligible(img) {
-  if (!img || img.dataset[PROCESSED_ATTR]) return false;
-  const inContainer = !!(img.closest && img.closest(CONTAINER_SELECTOR));
-  if (!inContainer && !isMeaningfulSize(img)) return false;
-  const url = resolveImageUrl(img);
-  return url.length > 0 && isGoogleusercontentUrl(url);
-}
-
-function injectButtons(img) {
-  if (img.dataset[PROCESSED_ATTR]) return;
-  img.dataset[PROCESSED_ATTR] = '1';
-
-  const container = (img.closest && img.closest(CONTAINER_SELECTOR)) || img.parentElement;
-  if (!container) return;
-  if (getComputedStyle(container).position === 'static') container.style.position = 'relative';
-
-  const wrap = document.createElement('div');
-  wrap.className = 'gwr-btn-wrap';
-
-  // Quick download button
-  const dlBtn = document.createElement('button');
-  dlBtn.className = 'gwr-btn gwr-btn-dl';
-  dlBtn.title = 'Quick Download (PNG, no watermark)';
-  dlBtn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span>Quick Download</span>`;
-
-  // Edit button
-  const editBtn = document.createElement('button');
-  editBtn.className = 'gwr-btn gwr-btn-edit';
-  editBtn.title = 'Open Image Editor';
-  editBtn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg><span>Edit</span>`;
-
-  function handleAction(btn, mode) {
-    const url = resolveImageUrl(img);
-    if (!url) { alert('[GWR] Failed to retrieve image URL'); return; }
-
-    // Fallback if extension context is invalidated
-    if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) {
-       alert('Extension context invalidated. Please refresh the page.');
-       return;
-    }
-
-    btn.disabled = true;
-    btn.querySelector('span').textContent = '⏳ Loading...';
-    try {
-      chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: url, mode }, (res) => {
-        btn.disabled = false;
-        btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit';
-        if (chrome.runtime.lastError) {
-          console.error('[GWR]', chrome.runtime.lastError.message);
-          btn.querySelector('span').textContent = '✗ Error';
-          setTimeout(() => { btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit'; }, 2500);
-          return;
-        }
-        if (!res?.ok) {
-          btn.querySelector('span').textContent = '✗ Error';
-          setTimeout(() => { btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit'; }, 2500);
-          console.error('[GWR]', res?.error);
-        }
-      });
-    } catch (err) {
-      btn.disabled = false;
-      btn.querySelector('span').textContent = btn === dlBtn ? 'Quick Download' : 'Edit';
-      alert('Connection error. Please refresh the page to try again.');
-    }
+  const urlObj = new URL(url);
+  const pathParts = urlObj.pathname.split('/');
+  
+  if (pathParts.length > 2 && pathParts[pathParts.length - 1].includes('=')) {
+    pathParts.pop();
+    urlObj.pathname = pathParts.join('/');
   }
-
-  dlBtn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); handleAction(dlBtn, 'download'); });
-  editBtn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); handleAction(editBtn, 'edit'); });
-
-  wrap.appendChild(dlBtn);
-  wrap.appendChild(editBtn);
-  container.appendChild(wrap);
+  return urlObj.toString() + '=s0';
 }
 
-function scanImages() {
-  CONTAINER_SELECTOR.split(',').forEach(sel => {
-    document.querySelectorAll(sel.trim() + ' img').forEach(img => {
-      if (isEligible(img)) injectButtons(img);
+function createButton(svgIcon, title) {
+    const btn = document.createElement('button');
+    btn.style.cssText = `
+      position: relative;
+      background: rgba(255, 255, 255, 0.2);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.6);
+      color: white;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      transition: all 0.2s ease;
+      padding: 0;
+      margin: 0;
+    `;
+    
+    const iconWrapper = document.createElement('div');
+    iconWrapper.innerHTML = svgIcon;
+    iconWrapper.style.display = 'flex';
+    
+    const tooltip = document.createElement('div');
+    tooltip.innerText = title;
+    tooltip.style.cssText = `
+      position: absolute;
+      bottom: 48px;
+      left: 50%;
+      transform: translateX(-50%) translateY(8px);
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.2s ease;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      backdrop-filter: blur(5px);
+      -webkit-backdrop-filter: blur(5px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    `;
+
+    btn.appendChild(iconWrapper);
+    btn.appendChild(tooltip);
+
+    btn.addEventListener('mouseenter', () => {
+      btn.style.background = 'rgba(255, 255, 255, 0.4)';
+      btn.style.transform = 'scale(1.1)';
+      tooltip.style.opacity = '1';
+      tooltip.style.transform = 'translateX(-50%) translateY(0)';
     });
-  });
-  document.querySelectorAll('img').forEach(img => {
-    if (isEligible(img) && isMeaningfulSize(img)) injectButtons(img);
-  });
+    btn.addEventListener('mouseleave', () => {
+      btn.style.background = 'rgba(255, 255, 255, 0.2)';
+      btn.style.transform = 'scale(1)';
+      tooltip.style.opacity = '0';
+      tooltip.style.transform = 'translateX(-50%) translateY(8px)';
+    });
+
+    return btn;
 }
 
-let isEnabled = true;
+function installButtonsInContainer(img) {
+    if (!img.src || img.src.startsWith('data:')) return;
+    if (img.width < 100 && img.height < 100) return;
+    const isGoogleImage = img.src.includes('googleusercontent.com') || img.src.startsWith('blob:');
+    if (!isGoogleImage) return;
 
-chrome.storage.local.get({'extensionEnabled': true}, res => {
-  isEnabled = res.extensionEnabled;
-  if (isEnabled) scanImages();
-});
-
-chrome.storage.onChanged.addListener(changes => {
-  if (changes.extensionEnabled !== undefined) {
-    isEnabled = changes.extensionEnabled.newValue;
-    if (isEnabled) {
-      scanImages();
-    } else {
-      document.querySelectorAll('.gwr-btn-wrap').forEach(el => el.remove());
-      document.querySelectorAll('[' + PROCESSED_ATTR + ']').forEach(img => {
-        delete img.dataset[PROCESSED_ATTR];
-      });
+    let container = img.parentElement;
+    if (container.style.position !== 'relative' && container.style.position !== 'absolute') {
+      container.style.position = 'relative';
     }
+
+    if (container.querySelector('.gw-action-container')) return;
+
+    const actionContainer = document.createElement('div');
+    actionContainer.className = 'gw-action-container';
+    
+    actionContainer.style.position = 'absolute';
+    actionContainer.style.bottom = '15px';
+    actionContainer.style.left = '50%';
+    actionContainer.style.transform = 'translateX(-50%)';
+    actionContainer.style.display = 'flex';
+    actionContainer.style.gap = '15px';
+    actionContainer.style.zIndex = '9999';
+
+    const downloadIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>`;
+    const originalBtn = createButton(downloadIcon, 'Download');
+    
+    const penIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
+    const removeBtn = createButton(penIcon, 'Edit');
+
+    originalBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const realUrl = resolveImageUrl(img);
+      const link = document.createElement('a');
+      link.href = realUrl;
+      link.download = 'gemini-image.png';
+      link.target = '_blank';
+      link.click();
+    });
+
+    removeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const resolvedUrl = resolveImageUrl(img);
+      chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: resolvedUrl, mode: 'editor' });
+    });
+
+    actionContainer.appendChild(originalBtn);
+    actionContainer.appendChild(removeBtn);
+    container.appendChild(actionContainer);
+}
+
+function installDownloadButtons() {
+  document.querySelectorAll('img').forEach((img) => installButtonsInContainer(img));
+}
+
+function observeShadowDom(element) {
+  if (element.shadowRoot) {
+    installDownloadButtonsInText(element.shadowRoot);
+    const shadowObserver = new MutationObserver(() => installDownloadButtonsInText(element.shadowRoot));
+    shadowObserver.observe(element.shadowRoot, { childList: true, subtree: true });
   }
+
+  Array.from(element.children).forEach(child => observeShadowDom(child));
+}
+
+function installDownloadButtonsInText(root) {
+  const images = root.querySelectorAll('img');
+  images.forEach(img => installButtonsInContainer(img));
+}
+
+function processAllShadowDoms() {
+  document.querySelectorAll('*').forEach(el => observeShadowDom(el));
+}
+
+const mainObserver = new MutationObserver(() => {
+  installDownloadButtons();
+  processAllShadowDoms();
 });
 
-new MutationObserver(() => {
-  if (isEnabled) scanImages();
-}).observe(document.body, { childList: true, subtree: true });
+mainObserver.observe(document.body, { childList: true, subtree: true });
+installDownloadButtons();
+processAllShadowDoms();
