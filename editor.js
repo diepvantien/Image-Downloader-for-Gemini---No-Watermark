@@ -325,9 +325,9 @@ function resolveOfficialGeminiSearchRules(
       if (scaleMismatchRatio > maxScaleMismatchRatio) return null;
 
       const rule = {
-        size: clamp(Math.round(baseRule.size * scale), minLogoSize, maxLogoSize),
-        marginRight: Math.max(8, Math.round(baseRule.marginRight * scaleX)),
-        marginBottom: Math.max(8, Math.round(baseRule.marginBottom * scaleY))
+        size: baseRule.size,
+        marginRight: baseRule.marginRight,
+        marginBottom: baseRule.marginBottom
       };
 
       const x = normalizedWidth - rule.marginRight - rule.size;
