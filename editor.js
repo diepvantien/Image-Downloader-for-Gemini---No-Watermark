@@ -33,10 +33,10 @@ const HALO_OUTER_MARGIN = 3;
 const ALPHA_GAIN_CANDIDATES = Object.freeze([
   1.05, 1.12, 1.2, 1.28, 1.36, 1.45, 1.52, 1.6, 1.7, 1.85, 2.0
 ]);
-const OUTLINE_REFINEMENT_THRESHOLD = 0.1;
-const OUTLINE_REFINEMENT_MIN_GAIN = 1.12;
-const SUBPIXEL_REFINE_SHIFTS = Object.freeze([-0.3, 0, 0.3]);
-const SUBPIXEL_REFINE_SCALES = Object.freeze([0.99, 1, 1.01]);
+const OUTLINE_REFINEMENT_THRESHOLD = 0.07;
+const OUTLINE_REFINEMENT_MIN_GAIN = 1.05;
+const SUBPIXEL_REFINE_SHIFTS = Object.freeze([-0.4, -0.2, 0, 0.2, 0.4]);
+const SUBPIXEL_REFINE_SCALES = Object.freeze([0.985, 1, 1.015]);
 const EDGE_CLEANUP_PRESETS = Object.freeze([
   { minAlpha: 0.03, maxAlpha: 0.45, radius: 2, strength: 0.7, outsideAlphaMax: 0.05 },
   { minAlpha: 0.06, maxAlpha: 0.58, radius: 3, strength: 0.75, outsideAlphaMax: 0.08 },
@@ -868,6 +868,45 @@ function recalibrateAlphaStrength({
     }
   }
 
+  const refinedCandidates = [];
+  for (let delta = -0.05; delta <= 0.05; delta += 0.01) {
+    refinedCandidates.push(Number((bestAlphaGain + delta).toFixed(2)));
+  }
+
+  for (const alphaGain of refinedCandidates) {
+    if (alphaGain <= 1 || alphaGain >= 3) continue;
+
+    const candidate = cloneImageData(sourceImageData);
+    const touched = removeWatermarkInPlace(candidate, alphaMap, position, alphaGain);
+    if (touched <= 0) continue;
+
+    const nearBlackRatio = calculateNearBlackRatio(candidate, position);
+    if (nearBlackRatio > maxAllowedNearBlackRatio) continue;
+
+    const spatialScore = computeRegionSpatialCorrelation({
+      imageData: candidate,
+      alphaMap,
+      region: { x: position.x, y: position.y, size: position.width }
+    });
+    const gradientScore = computeRegionGradientCorrelation({
+      imageData: candidate,
+      alphaMap,
+      region: { x: position.x, y: position.y, size: position.width }
+    });
+
+    const candidateAbs = Math.abs(spatialScore);
+    const worsenedGradient = gradientScore > baselineGradientScore + 0.06;
+    if (worsenedGradient) continue;
+
+    if (candidateAbs < bestAbs - EPSILON) {
+      bestAbs = candidateAbs;
+      bestImageData = candidate;
+      bestSpatialScore = spatialScore;
+      bestGradientScore = gradientScore;
+      bestAlphaGain = alphaGain;
+    }
+  }
+
   if (!bestImageData || baselineAbs - bestAbs < MIN_RECALIBRATION_SCORE_DELTA) {
     return null;
   }
@@ -899,6 +938,11 @@ function refineSubpixelOutline({
 
   const baselineNearBlackRatio = calculateNearBlackRatio(sourceImageData, position);
   const maxAllowedNearBlackRatio = Math.min(1, baselineNearBlackRatio + MAX_NEAR_BLACK_RATIO_INCREASE);
+  const baselineHalo = assessAlphaBandHalo({
+    imageData: sourceImageData,
+    position,
+    alphaMap
+  });
   const gainCandidates = [alphaGain];
   const lower = Math.max(1, Number((alphaGain - 0.01).toFixed(2)));
   const upper = Number((alphaGain + 0.01).toFixed(2));
@@ -928,8 +972,13 @@ function refineSubpixelOutline({
             alphaMap: warped,
             region: { x: position.x, y: position.y, size }
           });
+          const halo = assessAlphaBandHalo({
+            imageData: candidate,
+            position,
+            alphaMap: warped
+          });
 
-          const cost = Math.abs(spatialScore) * 0.6 + Math.max(0, gradientScore);
+          const cost = Math.abs(spatialScore) * 0.6 + Math.max(0, gradientScore) + halo.positiveDeltaLum * 0.02;
           if (!best || cost < best.cost) {
             best = {
               imageData: candidate,
@@ -937,6 +986,7 @@ function refineSubpixelOutline({
               alphaGain: gain,
               spatialScore,
               gradientScore,
+              halo,
               shift: { dx, dy, scale },
               cost
             };
@@ -950,7 +1000,12 @@ function refineSubpixelOutline({
 
   const improvedGradient = best.gradientScore <= baselineGradientScore - minGradientImprovement;
   const keptSpatial = Math.abs(best.spatialScore) <= Math.abs(baselineSpatialScore) + maxSpatialDrift;
-  if (!improvedGradient || !keptSpatial) return null;
+  const improvedHalo =
+    baselineHalo.positiveDeltaLum <= 0.8 ||
+    best.halo.positiveDeltaLum <= baselineHalo.positiveDeltaLum - 0.6 ||
+    best.halo.positiveDeltaLum <= baselineHalo.positiveDeltaLum * 0.8;
+
+  if ((!improvedGradient && !improvedHalo) || !keptSpatial) return null;
 
   return best;
 }
@@ -1257,6 +1312,7 @@ async function applyWatermarkRemoval(src) {
 
   let finalImageData = out;
   let finalMetrics = scoreRegion(finalImageData, alphaMap, region);
+  let effectiveAlphaGain = 1;
 
   const shouldRunExtraPasses =
     Math.abs(finalMetrics.spatialScore) > MULTI_PASS_RESIDUAL_THRESHOLD ||
@@ -1295,6 +1351,7 @@ async function applyWatermarkRemoval(src) {
         spatialScore: recalibrated.spatialScore,
         gradientScore: recalibrated.gradientScore
       };
+      effectiveAlphaGain = recalibrated.alphaGain;
     }
   }
 
@@ -1306,7 +1363,7 @@ async function applyWatermarkRemoval(src) {
       sourceImageData: finalImageData,
       alphaMap,
       position: region,
-      alphaGain: 1.12,
+      alphaGain: effectiveAlphaGain,
       baselineSpatialScore: finalMetrics.spatialScore,
       baselineGradientScore: finalMetrics.gradientScore
     });
@@ -1316,6 +1373,7 @@ async function applyWatermarkRemoval(src) {
         spatialScore: refinedSubpixel.spatialScore,
         gradientScore: refinedSubpixel.gradientScore
       };
+      effectiveAlphaGain = refinedSubpixel.alphaGain;
     }
   }
 
