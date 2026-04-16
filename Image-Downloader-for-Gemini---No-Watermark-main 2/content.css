@@ -1,0 +1,61 @@
+/* content.css */
+.gwr-btn-wrap {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  display: flex;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.gwr-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 13px;
+  border-radius: 20px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+  transition: all 0.15s ease;
+  border: 1px solid transparent;
+}
+
+.gwr-btn-dl {
+  background: rgba(244, 236, 216, 0.9);
+  color: #4a3e3d;
+  border-color: rgba(196, 115, 53, 0.4);
+}
+.gwr-btn-dl:hover {
+  background: rgba(238, 229, 206, 0.95);
+  border-color: rgba(196, 115, 53, 0.8);
+  color: #c47335;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 18px rgba(196, 115, 53, 0.25);
+}
+
+.gwr-btn-edit {
+  background: rgba(40, 32, 28, 0.85);
+  color: #e2d5b8;
+  border-color: rgba(140, 90, 90, 0.4);
+}
+.gwr-btn-edit:hover {
+  background: rgba(60, 48, 42, 0.95);
+  border-color: rgba(140, 90, 90, 0.8);
+  color: #fdf6e3;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 18px rgba(140, 90, 90, 0.25);
+}
+
+.gwr-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
+  transform: none;
+}
