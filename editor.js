@@ -384,10 +384,16 @@ function resolveInitialStandardRule({
 
   const fallbackRule = cloneRule(WATERMARK_RULES.normal);
   const primaryRule = defaultRule.size === 96 ? cloneRule(WATERMARK_RULES.large) : fallbackRule;
-  const alternateRule = defaultRule.size === 96 ? fallbackRule : cloneRule(WATERMARK_RULES.large);
-  const candidateRules = [primaryRule, alternateRule];
+  const candidateRules = [primaryRule];
 
-  for (const officialRule of resolveOfficialGeminiSearchRules(imageData.width, imageData.height, { limit: 1 })) {
+  // Keep 48px as the strict default. Only evaluate fallback-to-48 when default is 96.
+  if (defaultRule.size === 96) {
+    candidateRules.push(fallbackRule);
+  }
+
+  for (const officialRule of resolveOfficialGeminiSearchRules(imageData.width, imageData.height, { limit: 2 })) {
+    // Prevent accidental 96px escalation when current default is 48px.
+    if (defaultRule.size !== 96 && officialRule.size === 96) continue;
     if (!candidateRules.some((candidate) => buildRuleKey(candidate) === buildRuleKey(officialRule))) {
       candidateRules.push(officialRule);
     }
