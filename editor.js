@@ -23,9 +23,22 @@ const MAX_NEAR_BLACK_RATIO_INCREASE = 0.05;
 const EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT = 0.012;
 const EDGE_CLEANUP_MAX_SPATIAL_DRIFT = 0.08;
 const EDGE_CLEANUP_HALO_MIN_REDUCTION = 1.0;
+const EDGE_CLEANUP_MAX_ACCEPTED_SPATIAL = 0.22;
+const EDGE_CLEANUP_FINE_GRADIENT_THRESHOLD = 0.16;
+const EDGE_CLEANUP_FINE_MIN_GRADIENT_IMPROVEMENT = 0.005;
+const EDGE_CLEANUP_HALO_RELAXED_MIN_GRADIENT_IMPROVEMENT = 0.01;
+const EDGE_CLEANUP_STRONG_HALO_THRESHOLD = 4;
+const EDGE_CLEANUP_STRONG_GRADIENT_THRESHOLD = 0.45;
+const EDGE_CLEANUP_SPATIAL_THRESHOLD = 0.08;
+const EDGE_CLEANUP_HALO_SPATIAL_THRESHOLD = 0.18;
+const EDGE_CLEANUP_MAX_APPLIED_PASSES = 3;
 const RESIDUAL_RECALIBRATION_THRESHOLD = 0.24;
 const MIN_SUPPRESSION_FOR_SKIP_RECALIBRATION = 0.10;
 const MIN_RECALIBRATION_SCORE_DELTA = 0.03;
+const DETECTION_MIN_SCORE = 0.08;
+const DETECTION_MIN_QUALITY = 0.01;
+const DETECTION_MIN_SCORE_LOCAL = 0.12;
+const DETECTION_MIN_QUALITY_LOCAL = 0.02;
 const HALO_MIN_ALPHA = 0.12;
 const HALO_MAX_ALPHA = 0.35;
 const HALO_OUTSIDE_ALPHA_MAX = 0.01;
@@ -41,6 +54,18 @@ const EDGE_CLEANUP_PRESETS = Object.freeze([
   { minAlpha: 0.03, maxAlpha: 0.45, radius: 2, strength: 0.7, outsideAlphaMax: 0.05 },
   { minAlpha: 0.06, maxAlpha: 0.58, radius: 3, strength: 0.75, outsideAlphaMax: 0.08 },
   { minAlpha: 0.02, maxAlpha: 0.36, radius: 4, strength: 1.2, outsideAlphaMax: 0.05 }
+]);
+const EDGE_CLEANUP_AGGRESSIVE_PRESETS = Object.freeze([
+  {
+    minAlpha: 0.01,
+    maxAlpha: 0.55,
+    radius: 2,
+    strength: 1.3,
+    outsideAlphaMax: 0.05,
+    minGradientImprovement: 0.12,
+    maxSpatialDrift: 0.18,
+    maxAcceptedSpatial: 0.18
+  }
 ]);
 const ALPHA_CACHE = {};
 const ALPHA_MAP_URLS = {
@@ -1080,7 +1105,12 @@ function refineResidualEdge({
   alphaMap,
   position,
   baselineSpatialScore,
-  baselineGradientScore
+  baselineGradientScore,
+  minGradientImprovement = EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT,
+  maxSpatialDrift = EDGE_CLEANUP_MAX_SPATIAL_DRIFT,
+  maxAcceptedSpatial = EDGE_CLEANUP_MAX_ACCEPTED_SPATIAL,
+  minHaloReduction = EDGE_CLEANUP_HALO_MIN_REDUCTION,
+  allowAggressivePresets = false
 }) {
   const baselineHalo = assessAlphaBandHalo({
     imageData: sourceImageData,
@@ -1090,9 +1120,12 @@ function refineResidualEdge({
 
   const baselineNearBlackRatio = calculateNearBlackRatio(sourceImageData, position);
   const maxAllowedNearBlackRatio = Math.min(1, baselineNearBlackRatio + MAX_NEAR_BLACK_RATIO_INCREASE);
+  const presets = allowAggressivePresets
+    ? [...EDGE_CLEANUP_PRESETS, ...EDGE_CLEANUP_AGGRESSIVE_PRESETS]
+    : EDGE_CLEANUP_PRESETS;
   let best = null;
 
-  for (const preset of EDGE_CLEANUP_PRESETS) {
+  for (const preset of presets) {
     const candidate = blendResidualEdge({
       sourceImageData,
       alphaMap,
@@ -1119,17 +1152,21 @@ function refineResidualEdge({
       alphaMap
     });
 
+    const presetMinGradientImprovement = preset.minGradientImprovement ?? minGradientImprovement;
+    const presetMaxSpatialDrift = preset.maxSpatialDrift ?? maxSpatialDrift;
+    const presetMaxAcceptedSpatial = preset.maxAcceptedSpatial ?? maxAcceptedSpatial;
     const improvedGradient =
-      gradientScore <= baselineGradientScore - EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT ||
-      (baselineGradientScore <= 0.08 && gradientScore <= baselineGradientScore + 0.01);
-    const keptSpatial = Math.abs(spatialScore) <= Math.abs(baselineSpatialScore) + EDGE_CLEANUP_MAX_SPATIAL_DRIFT;
+      gradientScore <= baselineGradientScore - presetMinGradientImprovement ||
+      (baselineGradientScore <= EDGE_CLEANUP_FINE_GRADIENT_THRESHOLD && gradientScore <= baselineGradientScore + 0.01);
+    const keptSpatial = Math.abs(spatialScore) <= Math.abs(baselineSpatialScore) + presetMaxSpatialDrift;
+    const keptResidualWithinTarget = Math.abs(spatialScore) <= presetMaxAcceptedSpatial;
     const baselinePositiveHalo = baselineHalo.positiveDeltaLum;
     const candidatePositiveHalo = halo.positiveDeltaLum;
     const improvedHalo = baselinePositiveHalo < 1 ||
-      candidatePositiveHalo <= baselinePositiveHalo - EDGE_CLEANUP_HALO_MIN_REDUCTION ||
+      candidatePositiveHalo <= baselinePositiveHalo - minHaloReduction ||
       candidatePositiveHalo <= baselinePositiveHalo * 0.75;
 
-    if (!improvedGradient || !keptSpatial || !improvedHalo) continue;
+    if (!improvedGradient || !keptSpatial || !keptResidualWithinTarget || !improvedHalo) continue;
 
     const cost = Math.abs(spatialScore) * 0.6 + Math.max(0, gradientScore) + candidatePositiveHalo * 0.02;
     if (!best || cost < best.cost) {
@@ -1216,6 +1253,11 @@ function resolveInitialStandardRule({
         ? calculateWatermarkPosition(imageData.width, imageData.height, defaultRule)
         : { x: 0, y: 0, width: defaultRule?.size || 0, height: defaultRule?.size || 0 },
       score: Number.NEGATIVE_INFINITY,
+      qualityScore: Number.NEGATIVE_INFINITY,
+      residualCost: Number.POSITIVE_INFINITY,
+      suppressionGain: 0,
+      gradientGain: 0,
+      haloGain: 0,
       shiftX: 0,
       shiftY: 0
     };
@@ -1262,19 +1304,34 @@ function resolveInitialStandardRule({
     }
   }
 
-  if (bestEvaluation) return bestEvaluation.candidateMatch;
+  if (bestEvaluation) {
+    return {
+      ...bestEvaluation.candidateMatch,
+      qualityScore: bestEvaluation.qualityScore,
+      residualCost: bestEvaluation.residualCost,
+      suppressionGain: bestEvaluation.suppressionGain,
+      gradientGain: bestEvaluation.gradientGain,
+      haloGain: bestEvaluation.haloGain
+    };
+  }
 
   return {
     rule: defaultRule,
     region: calculateWatermarkPosition(imageData.width, imageData.height, defaultRule),
     score: Number.NEGATIVE_INFINITY,
+    qualityScore: Number.NEGATIVE_INFINITY,
+    residualCost: Number.POSITIVE_INFINITY,
+    suppressionGain: 0,
+    gradientGain: 0,
+    haloGain: 0,
     shiftX: 0,
     shiftY: 0
   };
 }
 
-async function applyWatermarkRemoval(src) {
+async function applyWatermarkRemoval(src, options = {}) {
   const { width: W, height: H } = src;
+  const isLocalUpload = options.isLocalUpload === true;
 
   setStatus('loading', 'Loading alpha maps…');
   const alpha48 = await loadAlphaMap(48);
@@ -1300,8 +1357,23 @@ async function applyWatermarkRemoval(src) {
     return { imageData: out, rule, detected: false };
   }
 
+  const minScore = isLocalUpload ? DETECTION_MIN_SCORE_LOCAL : DETECTION_MIN_SCORE;
+  const minQuality = isLocalUpload ? DETECTION_MIN_QUALITY_LOCAL : DETECTION_MIN_QUALITY;
+  const reliableByQuality = Number.isFinite(resolvedRule.qualityScore) && resolvedRule.qualityScore >= minQuality;
+  const reliableByScore = Number.isFinite(resolvedRule.score) && resolvedRule.score >= minScore;
+  const reliableByTrialGain =
+    (resolvedRule.suppressionGain ?? 0) > 0.005 ||
+    (resolvedRule.gradientGain ?? 0) > 0.003 ||
+    (resolvedRule.haloGain ?? 0) > 0.5;
+
+  if (!(reliableByQuality || reliableByScore || reliableByTrialGain)) {
+    return { imageData: out, rule, detected: false };
+  }
+
   const baseline = scoreRegion(src, alphaMap, region);
-  if (Math.abs(baseline.spatialScore) < 0.05 && baseline.gradientScore < 0.03) {
+  const baselineSpatialThreshold = isLocalUpload ? 0.07 : 0.05;
+  const baselineGradientThreshold = isLocalUpload ? 0.04 : 0.03;
+  if (Math.abs(baseline.spatialScore) < baselineSpatialThreshold && baseline.gradientScore < baselineGradientThreshold) {
     return { imageData: out, rule, detected: false };
   }
 
@@ -1377,11 +1449,32 @@ async function applyWatermarkRemoval(src) {
     }
   }
 
-  for (let round = 0; round < 2; round++) {
+  for (let round = 0; round < EDGE_CLEANUP_MAX_APPLIED_PASSES; round++) {
+    const haloBeforeRound = assessAlphaBandHalo({
+      imageData: finalImageData,
+      position: region,
+      alphaMap
+    });
     const shouldRefineEdges =
       finalMetrics.gradientScore > 0.08 ||
-      Math.abs(finalMetrics.spatialScore) > 0.12;
+      Math.abs(finalMetrics.spatialScore) > 0.12 ||
+      haloBeforeRound.positiveDeltaLum >= 1.6;
     if (!shouldRefineEdges) break;
+
+    let dynamicMinGradientImprovement = EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT;
+    if (finalMetrics.gradientScore <= EDGE_CLEANUP_FINE_GRADIENT_THRESHOLD) {
+      dynamicMinGradientImprovement = EDGE_CLEANUP_FINE_MIN_GRADIENT_IMPROVEMENT;
+    }
+    if (haloBeforeRound.positiveDeltaLum >= EDGE_CLEANUP_STRONG_HALO_THRESHOLD) {
+      dynamicMinGradientImprovement = Math.min(dynamicMinGradientImprovement, EDGE_CLEANUP_HALO_RELAXED_MIN_GRADIENT_IMPROVEMENT);
+    }
+
+    const allowAggressivePresets =
+      finalMetrics.gradientScore >= EDGE_CLEANUP_STRONG_GRADIENT_THRESHOLD &&
+      Math.abs(finalMetrics.spatialScore) <= EDGE_CLEANUP_SPATIAL_THRESHOLD;
+    const dynamicMaxSpatialDrift = haloBeforeRound.positiveDeltaLum >= EDGE_CLEANUP_STRONG_HALO_THRESHOLD
+      ? EDGE_CLEANUP_HALO_SPATIAL_THRESHOLD
+      : EDGE_CLEANUP_MAX_SPATIAL_DRIFT;
 
     const beforeCost = Math.abs(finalMetrics.spatialScore) * 0.62 + Math.max(0, finalMetrics.gradientScore);
     const refined = refineResidualEdge({
@@ -1389,7 +1482,11 @@ async function applyWatermarkRemoval(src) {
       alphaMap,
       position: region,
       baselineSpatialScore: finalMetrics.spatialScore,
-      baselineGradientScore: finalMetrics.gradientScore
+      baselineGradientScore: finalMetrics.gradientScore,
+      minGradientImprovement: dynamicMinGradientImprovement,
+      maxSpatialDrift: dynamicMaxSpatialDrift,
+      minHaloReduction: EDGE_CLEANUP_HALO_MIN_REDUCTION,
+      allowAggressivePresets
     });
     if (!refined) break;
 
@@ -1769,6 +1866,7 @@ async function init() {
   const params = new URLSearchParams(location.search);
   const key = params.get('key');
   const autoDownload = params.get('autoDownload') === '1';
+  const isLocalUpload = params.get('local') === '1';
 
   if (!key) {
     setStatus('error', 'Missing image key');
@@ -1787,7 +1885,7 @@ async function init() {
 
     $('loadingText').textContent = 'Removing watermark...';
     $('loadingSubText').textContent = 'Reverse Alpha Blending';
-    const result = await applyWatermarkRemoval(imageData);
+    const result = await applyWatermarkRemoval(imageData, { isLocalUpload });
     state.processedImageData = result.imageData;
     state.watermarkRule = result.detected ? result.rule : null;
     state.currentImageData = state.processedImageData;
