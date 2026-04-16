@@ -362,9 +362,6 @@ function detectWatermarkRule(imageWidth, imageHeight) {
   const officialRule = resolveOfficialGeminiWatermarkRule(imageWidth, imageHeight);
   if (officialRule) return officialRule;
 
-  if (imageWidth > 1024 && imageHeight > 1024) {
-    return cloneRule(WATERMARK_RULES.large);
-  }
   return cloneRule(WATERMARK_RULES.normal);
 }
 
