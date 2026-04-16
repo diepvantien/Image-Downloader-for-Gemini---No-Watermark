@@ -506,6 +506,92 @@ function getAlphaMapForRule(rule, alpha48, alpha96) {
   return alpha96 ? interpolateAlphaMap(alpha96, 96, rule.size) : null;
 }
 
+function buildSizeSweep(defaultSize, minSize, maxSize, step = 2) {
+  const out = [];
+  const normalizedDefault = clamp(Math.round(defaultSize), minSize, maxSize);
+  out.push(normalizedDefault);
+
+  for (let delta = step; delta <= Math.max(defaultSize - minSize, maxSize - defaultSize); delta += step) {
+    const lower = normalizedDefault - delta;
+    const upper = normalizedDefault + delta;
+    let added = false;
+
+    if (lower >= minSize) {
+      out.push(lower);
+      added = true;
+    }
+    if (upper <= maxSize) {
+      out.push(upper);
+      added = true;
+    }
+
+    if (!added) break;
+  }
+
+  return out;
+}
+
+function buildAdaptiveCandidateRules({
+  imageData,
+  defaultRule
+}) {
+  const candidates = [];
+  const seen = new Set();
+  const minSide = Math.min(imageData.width, imageData.height);
+
+  const addRule = (rule) => {
+    if (!rule) return;
+    const size = Math.max(24, Math.round(rule.size));
+    const marginRight = Math.max(8, Math.round(rule.marginRight));
+    const marginBottom = Math.max(8, Math.round(rule.marginBottom));
+    const normalizedRule = { size, marginRight, marginBottom };
+    const pos = calculateWatermarkPosition(imageData.width, imageData.height, normalizedRule);
+    if (!isRegionInsideImage(imageData, pos)) return;
+
+    const key = buildRuleKey(normalizedRule);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(normalizedRule);
+  };
+
+  addRule(defaultRule);
+
+  if (defaultRule.size === 96) {
+    addRule(cloneRule(WATERMARK_RULES.normal));
+  }
+
+  for (const officialRule of resolveOfficialGeminiSearchRules(imageData.width, imageData.height, { limit: 2 })) {
+    if (defaultRule.size !== 96 && officialRule.size === 96) continue;
+    addRule(officialRule);
+  }
+
+  const isDefault48 = defaultRule.size === 48;
+  const minSize = isDefault48 ? 30 : 72;
+  const maxSize = isDefault48
+    ? Math.min(64, Math.max(30, Math.floor(minSide * 0.18)))
+    : Math.min(128, Math.max(72, Math.floor(minSide * 0.24)));
+  const sizeList = buildSizeSweep(defaultRule.size, minSize, maxSize, 2);
+
+  for (const size of sizeList) {
+    const ratio = size / defaultRule.size;
+    addRule({
+      size,
+      marginRight: Math.max(8, Math.round(defaultRule.marginRight * ratio)),
+      marginBottom: Math.max(8, Math.round(defaultRule.marginBottom * ratio))
+    });
+
+    if (size !== defaultRule.size) {
+      addRule({
+        size,
+        marginRight: defaultRule.marginRight,
+        marginBottom: defaultRule.marginBottom
+      });
+    }
+  }
+
+  return candidates;
+}
+
 function findBestAnchorForRule({
   imageData,
   rule,
@@ -520,7 +606,7 @@ function findBestAnchorForRule({
   const radius = Number.isFinite(searchRadius)
     ? Math.max(0, Math.round(searchRadius))
     : Math.max(6, Math.round(rule.size * 0.33));
-  const coarseStep = rule.size >= 80 ? 2 : 1;
+  const coarseStep = rule.size >= 80 ? 3 : 2;
 
   const evaluateRegion = (x, y) => {
     const region = { x, y, width: rule.size, height: rule.size };
@@ -531,11 +617,13 @@ function findBestAnchorForRule({
       alphaMap,
       region: { x: region.x, y: region.y, size: region.width }
     });
-    const gradientScore = computeRegionGradientCorrelation({
-      imageData,
-      alphaMap,
-      region: { x: region.x, y: region.y, size: region.width }
-    });
+    const gradientScore = spatialScore > 0.04
+      ? computeRegionGradientCorrelation({
+          imageData,
+          alphaMap,
+          region: { x: region.x, y: region.y, size: region.width }
+        })
+      : 0;
     const score = Math.max(0, spatialScore) * 0.62 + Math.max(0, gradientScore) * 0.38;
 
     return { region, score, spatialScore, gradientScore };
@@ -903,22 +991,10 @@ function resolveInitialStandardRule({
     };
   }
 
-  const fallbackRule = cloneRule(WATERMARK_RULES.normal);
-  const primaryRule = defaultRule.size === 96 ? cloneRule(WATERMARK_RULES.large) : fallbackRule;
-  const candidateRules = [primaryRule];
-
-  // Keep 48px as the strict default. Only evaluate fallback-to-48 when default is 96.
-  if (defaultRule.size === 96) {
-    candidateRules.push(fallbackRule);
-  }
-
-  for (const officialRule of resolveOfficialGeminiSearchRules(imageData.width, imageData.height, { limit: 2 })) {
-    // Prevent accidental 96px escalation when current default is 48px.
-    if (defaultRule.size !== 96 && officialRule.size === 96) continue;
-    if (!candidateRules.some((candidate) => buildRuleKey(candidate) === buildRuleKey(officialRule))) {
-      candidateRules.push(officialRule);
-    }
-  }
+  const candidateRules = buildAdaptiveCandidateRules({
+    imageData,
+    defaultRule
+  });
 
   let bestMatch = null;
 
@@ -930,7 +1006,7 @@ function resolveInitialStandardRule({
       imageData,
       rule: candidateRule,
       alphaMap,
-      searchRadius: Math.max(6, Math.round(candidateRule.size * 0.33))
+      searchRadius: Math.max(10, Math.round(candidateRule.size * 0.52))
     });
     if (!candidateMatch) continue;
 
