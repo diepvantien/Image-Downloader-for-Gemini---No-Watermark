@@ -37,8 +37,8 @@ const MIN_SUPPRESSION_FOR_SKIP_RECALIBRATION = 0.10;
 const MIN_RECALIBRATION_SCORE_DELTA = 0.03;
 const DETECTION_MIN_SCORE = 0.08;
 const DETECTION_MIN_QUALITY = 0.01;
-const DETECTION_MIN_SCORE_LOCAL = 0.12;
-const DETECTION_MIN_QUALITY_LOCAL = 0.02;
+const DETECTION_MIN_SCORE_LOCAL = 0.14;
+const DETECTION_MIN_QUALITY_LOCAL = 0.03;
 const HALO_MIN_ALPHA = 0.12;
 const HALO_MAX_ALPHA = 0.35;
 const HALO_OUTSIDE_ALPHA_MAX = 0.01;
@@ -815,14 +815,14 @@ function removeRepeatedWatermarkLayers({
     if (nearBlackRatio > maxNearBlackRatio) break;
 
     const worsenedTooMuch =
-      Math.abs(after.spatialScore) > Math.abs(before.spatialScore) + 0.08 &&
-      after.gradientScore > before.gradientScore + 0.06;
+      Math.abs(after.spatialScore) > Math.abs(before.spatialScore) + 0.10 &&
+      after.gradientScore > before.gradientScore + 0.08;
     if (worsenedTooMuch) break;
 
     currentImageData = candidate;
     appliedPassCount++;
 
-    if (Math.abs(after.spatialScore) <= residualThreshold && after.gradientScore <= 0.12) break;
+    if (Math.abs(after.spatialScore) <= residualThreshold && after.gradientScore <= 0.10) break;
   }
 
   return {
@@ -840,7 +840,7 @@ function shouldRecalibrateAlphaStrength({
   const suppressionGain = originalAbs - processedAbs;
 
   return originalAbs >= RESIDUAL_RECALIBRATION_THRESHOLD &&
-    processedAbs >= RESIDUAL_RECALIBRATION_THRESHOLD &&
+    (processedAbs >= 0.15 || processedAbs >= originalAbs * 0.4) &&
     suppressionGain <= MIN_SUPPRESSION_FOR_SKIP_RECALIBRATION;
 }
 
@@ -894,8 +894,8 @@ function recalibrateAlphaStrength({
   }
 
   const refinedCandidates = [];
-  for (let delta = -0.05; delta <= 0.05; delta += 0.01) {
-    refinedCandidates.push(Number((bestAlphaGain + delta).toFixed(2)));
+  for (let delta = -0.05; delta <= 0.05; delta += 0.005) {
+    refinedCandidates.push(Number((bestAlphaGain + delta).toFixed(3)));
   }
 
   for (const alphaGain of refinedCandidates) {
@@ -969,10 +969,14 @@ function refineSubpixelOutline({
     alphaMap
   });
   const gainCandidates = [alphaGain];
-  const lower = Math.max(1, Number((alphaGain - 0.01).toFixed(2)));
-  const upper = Number((alphaGain + 0.01).toFixed(2));
-  if (lower !== alphaGain) gainCandidates.push(lower);
-  if (upper !== alphaGain) gainCandidates.push(upper);
+  for (let delta = -0.02; delta <= 0.02; delta += 0.005) {
+    if (delta !== 0) {
+      const candidate = Number((alphaGain + delta).toFixed(3));
+      if (candidate >= 1 && !gainCandidates.includes(candidate)) {
+        gainCandidates.push(candidate);
+      }
+    }
+  }
 
   let best = null;
   for (const scale of scaleCandidates) {
@@ -1003,7 +1007,7 @@ function refineSubpixelOutline({
             alphaMap: warped
           });
 
-          const cost = Math.abs(spatialScore) * 0.6 + Math.max(0, gradientScore) + halo.positiveDeltaLum * 0.02;
+          const cost = Math.abs(spatialScore) * 0.5 + Math.max(0, gradientScore) * 0.85 + halo.positiveDeltaLum * 0.15;
           if (!best || cost < best.cost) {
             best = {
               imageData: candidate,
@@ -1164,11 +1168,11 @@ function refineResidualEdge({
     const candidatePositiveHalo = halo.positiveDeltaLum;
     const improvedHalo = baselinePositiveHalo < 1 ||
       candidatePositiveHalo <= baselinePositiveHalo - minHaloReduction ||
-      candidatePositiveHalo <= baselinePositiveHalo * 0.75;
+      candidatePositiveHalo <= baselinePositiveHalo * 0.6;
 
     if (!improvedGradient || !keptSpatial || !keptResidualWithinTarget || !improvedHalo) continue;
 
-    const cost = Math.abs(spatialScore) * 0.6 + Math.max(0, gradientScore) + candidatePositiveHalo * 0.02;
+    const cost = Math.abs(spatialScore) * 0.45 + Math.max(0, gradientScore) * 0.75 + candidatePositiveHalo * 0.18;
     if (!best || cost < best.cost) {
       best = {
         imageData: candidate,
@@ -1361,19 +1365,31 @@ async function applyWatermarkRemoval(src, options = {}) {
   const minQuality = isLocalUpload ? DETECTION_MIN_QUALITY_LOCAL : DETECTION_MIN_QUALITY;
   const reliableByQuality = Number.isFinite(resolvedRule.qualityScore) && resolvedRule.qualityScore >= minQuality;
   const reliableByScore = Number.isFinite(resolvedRule.score) && resolvedRule.score >= minScore;
+  
+  // For local uploads, require both score AND quality, not just one
+  const localUploadGateStrict = isLocalUpload ? (reliableByQuality && reliableByScore) : (reliableByQuality || reliableByScore);
+  
+  const minTrialGainSuppression = isLocalUpload ? 0.012 : 0.005;
+  const minTrialGainGradient = isLocalUpload ? 0.008 : 0.003;
+  const minTrialGainHalo = isLocalUpload ? 0.8 : 0.5;
   const reliableByTrialGain =
-    (resolvedRule.suppressionGain ?? 0) > 0.005 ||
-    (resolvedRule.gradientGain ?? 0) > 0.003 ||
-    (resolvedRule.haloGain ?? 0) > 0.5;
+    (resolvedRule.suppressionGain ?? 0) > minTrialGainSuppression ||
+    (resolvedRule.gradientGain ?? 0) > minTrialGainGradient ||
+    (resolvedRule.haloGain ?? 0) > minTrialGainHalo;
 
-  if (!(reliableByQuality || reliableByScore || reliableByTrialGain)) {
+  if (!(localUploadGateStrict || reliableByTrialGain)) {
     return { imageData: out, rule, detected: false };
   }
 
   const baseline = scoreRegion(src, alphaMap, region);
-  const baselineSpatialThreshold = isLocalUpload ? 0.07 : 0.05;
-  const baselineGradientThreshold = isLocalUpload ? 0.04 : 0.03;
-  if (Math.abs(baseline.spatialScore) < baselineSpatialThreshold && baseline.gradientScore < baselineGradientThreshold) {
+  const baselineSpatialThreshold = isLocalUpload ? 0.09 : 0.05;
+  const baselineGradientThreshold = isLocalUpload ? 0.06 : 0.03;
+  const hasStrongSpatialSignal = Math.abs(baseline.spatialScore) >= baselineSpatialThreshold;
+  const hasStrongGradientSignal = baseline.gradientScore >= baselineGradientThreshold;
+  
+  // For local uploads, require at least one strong signal (not weak signals on both)
+  const localUploadSignalGate = isLocalUpload ? (hasStrongSpatialSignal || hasStrongGradientSignal) : (hasStrongSpatialSignal || hasStrongGradientSignal);
+  if (!localUploadSignalGate) {
     return { imageData: out, rule, detected: false };
   }
 
@@ -1388,7 +1404,8 @@ async function applyWatermarkRemoval(src, options = {}) {
 
   const shouldRunExtraPasses =
     Math.abs(finalMetrics.spatialScore) > MULTI_PASS_RESIDUAL_THRESHOLD ||
-    finalMetrics.gradientScore > 0.12;
+    finalMetrics.gradientScore > 0.12 ||
+    (Math.abs(finalMetrics.spatialScore) > 0.10 && finalMetrics.gradientScore > 0.06);
 
   if (shouldRunExtraPasses) {
     const extraPassResult = removeRepeatedWatermarkLayers({
@@ -1428,7 +1445,7 @@ async function applyWatermarkRemoval(src, options = {}) {
   }
 
   const shouldRefineSubpixel =
-    finalMetrics.gradientScore >= OUTLINE_REFINEMENT_THRESHOLD &&
+    finalMetrics.gradientScore >= 0.04 &&
     Math.abs(finalMetrics.spatialScore) <= 0.35;
   if (shouldRefineSubpixel) {
     const refinedSubpixel = refineSubpixelOutline({
@@ -1456,9 +1473,9 @@ async function applyWatermarkRemoval(src, options = {}) {
       alphaMap
     });
     const shouldRefineEdges =
-      finalMetrics.gradientScore > 0.08 ||
-      Math.abs(finalMetrics.spatialScore) > 0.12 ||
-      haloBeforeRound.positiveDeltaLum >= 1.6;
+      finalMetrics.gradientScore > 0.06 ||
+      Math.abs(finalMetrics.spatialScore) > 0.10 ||
+      haloBeforeRound.positiveDeltaLum >= 1.2;
     if (!shouldRefineEdges) break;
 
     let dynamicMinGradientImprovement = EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT;
@@ -1476,7 +1493,7 @@ async function applyWatermarkRemoval(src, options = {}) {
       ? EDGE_CLEANUP_HALO_SPATIAL_THRESHOLD
       : EDGE_CLEANUP_MAX_SPATIAL_DRIFT;
 
-    const beforeCost = Math.abs(finalMetrics.spatialScore) * 0.62 + Math.max(0, finalMetrics.gradientScore);
+    const beforeCost = Math.abs(finalMetrics.spatialScore) * 0.45 + Math.max(0, finalMetrics.gradientScore) * 0.75;
     const refined = refineResidualEdge({
       sourceImageData: finalImageData,
       alphaMap,
@@ -1496,7 +1513,7 @@ async function applyWatermarkRemoval(src, options = {}) {
       gradientScore: refined.gradientScore
     };
 
-    const afterCost = Math.abs(finalMetrics.spatialScore) * 0.62 + Math.max(0, finalMetrics.gradientScore);
+    const afterCost = Math.abs(finalMetrics.spatialScore) * 0.45 + Math.max(0, finalMetrics.gradientScore) * 0.75;
     if (beforeCost - afterCost < 0.005) break;
   }
 
