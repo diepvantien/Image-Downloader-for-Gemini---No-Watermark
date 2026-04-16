@@ -1,17 +1,46 @@
 
 function resolveImageUrl(imgElement) {
   let url = imgElement.src || '';
-  if (url.startsWith('blob:')) return url;
-  if (!url.includes('googleusercontent.com')) return url;
+  if (url.startsWith('blob:') || url.startsWith('data:')) return url;
+  if (!url.includes('googleusercontent.com') && !url.includes('lh3.google.com')) return url;
 
-  const urlObj = new URL(url);
-  const pathParts = urlObj.pathname.split('/');
-  
-  if (pathParts.length > 2 && pathParts[pathParts.length - 1].includes('=')) {
-    pathParts.pop();
-    urlObj.pathname = pathParts.join('/');
+  try {
+    const urlObj = new URL(url);
+    let path = urlObj.pathname;
+    if (path.includes('=')) {
+      path = path.split('=')[0]; 
+    }
+    urlObj.pathname = path + '=s0';
+    return urlObj.toString();
+  } catch (e) {
+    return url;
   }
-  return urlObj.toString() + '=s0';
+}
+
+async function processImageRequest(img, mode) {
+  let url = img.src || '';
+  
+  // Service Workers (background.js) cannot fetch blob: URLs directly.
+  // We must convert them to Data URLs and pass them via messaging.
+  if (url.startsWith('blob:')) {
+    try {
+      const res = await fetch(url);
+      const blob = await res.blob();
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: reader.result, mode });
+      };
+      reader.onerror = () => alert("Could not read image blob");
+      reader.readAsDataURL(blob);
+    } catch (e) {
+      console.error('Failed to convert blob URL', e);
+      alert("Failed to grab this blob image. Please try again.");
+    }
+  } else {
+    // Normal HTTP URLs can be deferred to background script
+    const realUrl = resolveImageUrl(img);
+    chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: realUrl, mode });
+  }
 }
 
 function createButton(svgIcon, title) {
@@ -115,14 +144,12 @@ function installButtonsInContainer(img) {
 
     originalBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const realUrl = resolveImageUrl(img);
-      chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: realUrl, mode: 'download' });
+      processImageRequest(img, 'download');
     });
 
     removeBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const resolvedUrl = resolveImageUrl(img);
-      chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: resolvedUrl, mode: 'editor' });
+      processImageRequest(img, 'editor');
     });
 
     actionContainer.appendChild(originalBtn);

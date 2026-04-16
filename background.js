@@ -142,6 +142,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function captureImageOriginal(imageUrl) {
+  if (imageUrl.startsWith('data:')) {
+    const storeKey = 'img_' + Date.now();
+    imageStore.set(storeKey, imageUrl);
+    setTimeout(() => imageStore.delete(storeKey), 10 * 60 * 1000);
+    return storeKey;
+  }
+
   const fullUrl = normalizeUrl(imageUrl);
   try {
     const res = await fetch(fullUrl);
