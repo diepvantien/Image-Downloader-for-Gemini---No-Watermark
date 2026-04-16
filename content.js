@@ -116,11 +116,7 @@ function installButtonsInContainer(img) {
     originalBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const realUrl = resolveImageUrl(img);
-      const link = document.createElement('a');
-      link.href = realUrl;
-      link.download = 'gemini-image.png';
-      link.target = '_blank';
-      link.click();
+      chrome.runtime.sendMessage({ type: 'OPEN_EDITOR', imageUrl: realUrl, mode: 'download' });
     });
 
     removeBtn.addEventListener('click', (e) => {

@@ -13,6 +13,7 @@ const WATERMARK_CONFIG_BY_TIER = Object.freeze({
 });
 const MAX_ALPHA = 0.99;
 const ALPHA_NOISE_FLOOR = 3 / 255;
+const ALPHA_EXPAND_FACTOR = 1.08; // Phóng đại nhẹ alpha để xóa sạch viền mờ (anti-aliasing)
 const ALPHA_THRESHOLD = 0.002;
 const LOGO_VALUE = 255;
 const EPSILON = 1e-8;
@@ -461,10 +462,13 @@ async function applyWatermarkRemoval(src) {
   for (let row = 0; row < region.height; row++) {
     for (let col = 0; col < region.width; col++) {
       const rawAlpha = alphaMap[row * region.width + col];
-      const signalAlpha = Math.max(0, rawAlpha - ALPHA_NOISE_FLOOR);
-      if (signalAlpha < ALPHA_THRESHOLD) continue;
+      
+      // Calculate true alpha by subtracting noise floor, expanding to remove light borders, and clamping
+      const alpha = Math.max(0, Math.min(MAX_ALPHA, (rawAlpha - ALPHA_NOISE_FLOOR) * ALPHA_EXPAND_FACTOR));
+      
+      // Skip negligible alpha values to avoid artifacts
+      if (alpha < ALPHA_THRESHOLD) continue;
 
-      const alpha = Math.min(rawAlpha, MAX_ALPHA);
       const oneMinusAlpha = 1.0 - alpha;
       const idx = ((region.y + row) * W + (region.x + col)) * 4;
 
