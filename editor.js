@@ -23,10 +23,16 @@ const MAX_NEAR_BLACK_RATIO_INCREASE = 0.05;
 const EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT = 0.012;
 const EDGE_CLEANUP_MAX_SPATIAL_DRIFT = 0.08;
 const EDGE_CLEANUP_HALO_MIN_REDUCTION = 1.0;
+const RESIDUAL_RECALIBRATION_THRESHOLD = 0.48;
+const MIN_SUPPRESSION_FOR_SKIP_RECALIBRATION = 0.16;
+const MIN_RECALIBRATION_SCORE_DELTA = 0.06;
 const HALO_MIN_ALPHA = 0.12;
 const HALO_MAX_ALPHA = 0.35;
 const HALO_OUTSIDE_ALPHA_MAX = 0.01;
 const HALO_OUTER_MARGIN = 3;
+const ALPHA_GAIN_CANDIDATES = Object.freeze([
+  1.05, 1.12, 1.2, 1.28, 1.36, 1.45, 1.52, 1.6, 1.7, 1.85, 2.0
+]);
 const EDGE_CLEANUP_PRESETS = Object.freeze([
   { minAlpha: 0.03, maxAlpha: 0.45, radius: 2, strength: 0.7, outsideAlphaMax: 0.05 },
   { minAlpha: 0.06, maxAlpha: 0.58, radius: 3, strength: 0.75, outsideAlphaMax: 0.08 },
@@ -520,13 +526,19 @@ function findBestAnchorForRule({
     const region = { x, y, width: rule.size, height: rule.size };
     if (!isRegionInsideImage(imageData, region)) return null;
 
-    const score = computeRegionSpatialCorrelation({
+    const spatialScore = computeRegionSpatialCorrelation({
       imageData,
       alphaMap,
       region: { x: region.x, y: region.y, size: region.width }
     });
+    const gradientScore = computeRegionGradientCorrelation({
+      imageData,
+      alphaMap,
+      region: { x: region.x, y: region.y, size: region.width }
+    });
+    const score = Math.max(0, spatialScore) * 0.62 + Math.max(0, gradientScore) * 0.38;
 
-    return { region, score };
+    return { region, score, spatialScore, gradientScore };
   };
 
   let best = evaluateRegion(expectedRegion.x, expectedRegion.y);
@@ -547,8 +559,11 @@ function findBestAnchorForRule({
       const improvedScore = candidate.score > best.score + EPSILON;
       const tieBreakCloser =
         Math.abs(candidate.score - best.score) <= EPSILON && candidateDistance < bestDistance;
+      const tieBreakBySpatial =
+        Math.abs(candidate.score - best.score) <= EPSILON &&
+        Math.abs(candidate.spatialScore) > Math.abs(best.spatialScore) + EPSILON;
 
-      if (improvedScore || tieBreakCloser) {
+      if (improvedScore || tieBreakCloser || tieBreakBySpatial) {
         best = candidate;
         bestDx = dx;
         bestDy = dy;
@@ -567,8 +582,11 @@ function findBestAnchorForRule({
         const improvedScore = candidate.score > best.score + EPSILON;
         const tieBreakCloser =
           Math.abs(candidate.score - best.score) <= EPSILON && candidateDistance < bestDistance;
+        const tieBreakBySpatial =
+          Math.abs(candidate.score - best.score) <= EPSILON &&
+          Math.abs(candidate.spatialScore) > Math.abs(best.spatialScore) + EPSILON;
 
-        if (improvedScore || tieBreakCloser) {
+        if (improvedScore || tieBreakCloser || tieBreakBySpatial) {
           best = candidate;
           bestDx = dx;
           bestDy = dy;
@@ -593,8 +611,10 @@ function removeWatermarkInPlace(imageData, alphaMap, position, alphaGain = 1) {
   for (let row = 0; row < position.height; row++) {
     for (let col = 0; col < position.width; col++) {
       const rawAlpha = alphaMap[row * position.width + col];
-      const alpha = Math.max(0, Math.min(MAX_ALPHA, (rawAlpha - ALPHA_NOISE_FLOOR) * ALPHA_EXPAND_FACTOR * gain));
-      if (alpha < ALPHA_THRESHOLD) continue;
+      const signalAlpha = Math.max(0, rawAlpha - ALPHA_NOISE_FLOOR) * ALPHA_EXPAND_FACTOR * gain;
+      if (signalAlpha < ALPHA_THRESHOLD) continue;
+
+      const alpha = Math.min(rawAlpha * gain, MAX_ALPHA);
 
       const oneMinusAlpha = 1.0 - alpha;
       const idx = ((position.y + row) * imageData.width + (position.x + col)) * 4;
@@ -650,6 +670,80 @@ function removeRepeatedWatermarkLayers({
   return {
     imageData: currentImageData,
     passCount: appliedPassCount
+  };
+}
+
+function shouldRecalibrateAlphaStrength({
+  originalSpatialScore,
+  processedSpatialScore
+}) {
+  const originalAbs = Math.abs(originalSpatialScore);
+  const processedAbs = Math.abs(processedSpatialScore);
+  const suppressionGain = originalAbs - processedAbs;
+
+  return originalAbs >= RESIDUAL_RECALIBRATION_THRESHOLD &&
+    processedAbs >= RESIDUAL_RECALIBRATION_THRESHOLD &&
+    suppressionGain <= MIN_SUPPRESSION_FOR_SKIP_RECALIBRATION;
+}
+
+function recalibrateAlphaStrength({
+  sourceImageData,
+  alphaMap,
+  position,
+  baselineSpatialScore,
+  baselineGradientScore
+}) {
+  const baselineNearBlackRatio = calculateNearBlackRatio(sourceImageData, position);
+  const maxAllowedNearBlackRatio = Math.min(1, baselineNearBlackRatio + MAX_NEAR_BLACK_RATIO_INCREASE);
+  const baselineAbs = Math.abs(baselineSpatialScore);
+
+  let bestAbs = baselineAbs;
+  let bestImageData = null;
+  let bestSpatialScore = baselineSpatialScore;
+  let bestGradientScore = baselineGradientScore;
+  let bestAlphaGain = 1;
+
+  for (const alphaGain of ALPHA_GAIN_CANDIDATES) {
+    const candidate = cloneImageData(sourceImageData);
+    const touched = removeWatermarkInPlace(candidate, alphaMap, position, alphaGain);
+    if (touched <= 0) continue;
+
+    const nearBlackRatio = calculateNearBlackRatio(candidate, position);
+    if (nearBlackRatio > maxAllowedNearBlackRatio) continue;
+
+    const spatialScore = computeRegionSpatialCorrelation({
+      imageData: candidate,
+      alphaMap,
+      region: { x: position.x, y: position.y, size: position.width }
+    });
+    const gradientScore = computeRegionGradientCorrelation({
+      imageData: candidate,
+      alphaMap,
+      region: { x: position.x, y: position.y, size: position.width }
+    });
+
+    const candidateAbs = Math.abs(spatialScore);
+    const worsenedGradient = gradientScore > baselineGradientScore + 0.06;
+    if (worsenedGradient) continue;
+
+    if (candidateAbs < bestAbs - EPSILON) {
+      bestAbs = candidateAbs;
+      bestImageData = candidate;
+      bestSpatialScore = spatialScore;
+      bestGradientScore = gradientScore;
+      bestAlphaGain = alphaGain;
+    }
+  }
+
+  if (!bestImageData || baselineAbs - bestAbs < MIN_RECALIBRATION_SCORE_DELTA) {
+    return null;
+  }
+
+  return {
+    imageData: bestImageData,
+    spatialScore: bestSpatialScore,
+    gradientScore: bestGradientScore,
+    alphaGain: bestAlphaGain
   };
 }
 
@@ -762,7 +856,9 @@ function refineResidualEdge({
       alphaMap
     });
 
-    const improvedGradient = gradientScore <= baselineGradientScore - EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT;
+    const improvedGradient =
+      gradientScore <= baselineGradientScore - EDGE_CLEANUP_MIN_GRADIENT_IMPROVEMENT ||
+      (baselineGradientScore <= 0.08 && gradientScore <= baselineGradientScore + 0.01);
     const keptSpatial = Math.abs(spatialScore) <= Math.abs(baselineSpatialScore) + EDGE_CLEANUP_MAX_SPATIAL_DRIFT;
     const baselinePositiveHalo = baselineHalo.positiveDeltaLum;
     const candidatePositiveHalo = halo.positiveDeltaLum;
@@ -901,11 +997,11 @@ async function applyWatermarkRemoval(src) {
   }
 
   let finalImageData = out;
-  let firstPassMetrics = scoreRegion(finalImageData, alphaMap, region);
+  let finalMetrics = scoreRegion(finalImageData, alphaMap, region);
 
   const shouldRunExtraPasses =
-    Math.abs(firstPassMetrics.spatialScore) > MULTI_PASS_RESIDUAL_THRESHOLD ||
-    firstPassMetrics.gradientScore > 0.12;
+    Math.abs(finalMetrics.spatialScore) > MULTI_PASS_RESIDUAL_THRESHOLD ||
+    finalMetrics.gradientScore > 0.12;
 
   if (shouldRunExtraPasses) {
     const extraPassResult = removeRepeatedWatermarkLayers({
@@ -918,32 +1014,53 @@ async function applyWatermarkRemoval(src) {
     });
     if (extraPassResult.passCount > 0) {
       finalImageData = extraPassResult.imageData;
-      firstPassMetrics = scoreRegion(finalImageData, alphaMap, region);
+      finalMetrics = scoreRegion(finalImageData, alphaMap, region);
+    }
+  }
+
+  const shouldRecalibrate = shouldRecalibrateAlphaStrength({
+    originalSpatialScore: baseline.spatialScore,
+    processedSpatialScore: finalMetrics.spatialScore
+  });
+  if (shouldRecalibrate) {
+    const recalibrated = recalibrateAlphaStrength({
+      sourceImageData: finalImageData,
+      alphaMap,
+      position: region,
+      baselineSpatialScore: finalMetrics.spatialScore,
+      baselineGradientScore: finalMetrics.gradientScore
+    });
+    if (recalibrated) {
+      finalImageData = recalibrated.imageData;
+      finalMetrics = {
+        spatialScore: recalibrated.spatialScore,
+        gradientScore: recalibrated.gradientScore
+      };
     }
   }
 
   const shouldRefineEdges =
-    firstPassMetrics.gradientScore > 0.08 ||
-    Math.abs(firstPassMetrics.spatialScore) > 0.12;
+    finalMetrics.gradientScore > 0.08 ||
+    Math.abs(finalMetrics.spatialScore) > 0.12;
   if (shouldRefineEdges) {
     const refined = refineResidualEdge({
       sourceImageData: finalImageData,
       alphaMap,
       position: region,
-      baselineSpatialScore: firstPassMetrics.spatialScore,
-      baselineGradientScore: firstPassMetrics.gradientScore
+      baselineSpatialScore: finalMetrics.spatialScore,
+      baselineGradientScore: finalMetrics.gradientScore
     });
     if (refined) {
       finalImageData = refined.imageData;
-      firstPassMetrics = {
+      finalMetrics = {
         spatialScore: refined.spatialScore,
         gradientScore: refined.gradientScore
       };
     }
   }
 
-  const suppressionGain = Math.abs(baseline.spatialScore) - Math.abs(firstPassMetrics.spatialScore);
-  const detected = firstTouchedPixelCount > 0 && (suppressionGain > 0 || firstPassMetrics.gradientScore < baseline.gradientScore);
+  const suppressionGain = Math.abs(baseline.spatialScore) - Math.abs(finalMetrics.spatialScore);
+  const detected = firstTouchedPixelCount > 0 && (suppressionGain > 0 || finalMetrics.gradientScore < baseline.gradientScore);
 
   return { imageData: finalImageData, rule, detected };
 }
