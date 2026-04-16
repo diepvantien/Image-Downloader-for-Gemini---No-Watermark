@@ -8,8 +8,8 @@ const WATERMARK_RULES = Object.freeze({
 const WATERMARK_CONFIG_BY_TIER = Object.freeze({
   '0.5k': WATERMARK_RULES.normal,
   '1k': WATERMARK_RULES.normal,
-  '2k': WATERMARK_RULES.normal,
-  '4k': WATERMARK_RULES.normal
+  '2k': WATERMARK_RULES.large,
+  '4k': WATERMARK_RULES.large
 });
 const MAX_ALPHA = 0.99;
 const ALPHA_NOISE_FLOOR = 3 / 255;
@@ -362,7 +362,8 @@ function detectWatermarkRule(imageWidth, imageHeight) {
   const officialRule = resolveOfficialGeminiWatermarkRule(imageWidth, imageHeight);
   if (officialRule) return officialRule;
 
-  if (imageWidth > 1024 && imageHeight > 1024) {
+  // Fallback heuristic: If the longest side is >= 1536 or both sides are > 1024, assume large watermark
+  if (Math.max(imageWidth, imageHeight) >= 1536 || (imageWidth > 1024 && imageHeight > 1024)) {
     return cloneRule(WATERMARK_RULES.large);
   }
   return cloneRule(WATERMARK_RULES.normal);
